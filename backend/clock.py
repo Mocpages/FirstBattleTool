@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
-from backend.config import FULDA_OFFSET_MS, FULDA_SUN_LAT, FULDA_SUN_LON, SIM_TICK_MS
+from backend.config import FULDA_OFFSET_MS, FULDA_SUN_LON, MINUTE_MS
 
 MONTH_ABBR = ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC")
 
@@ -24,8 +24,21 @@ class ExerciseClock:
     def __init__(self, sim_ms: int | None = None) -> None:
         self.sim_ms = sim_ms if sim_ms is not None else INITIAL_SIM_INSTANT_MS
 
-    def tick(self) -> None:
-        self.sim_ms += SIM_TICK_MS
+    def advance_minutes(self, minutes: int = 1) -> None:
+        self.sim_ms += int(minutes) * MINUTE_MS
+
+    @staticmethod
+    def format_duration(ms: int) -> str:
+        if ms < 0:
+            ms = 0
+        total_min = ms // MINUTE_MS
+        if total_min < 60:
+            return f"{total_min} min"
+        hh = total_min // 60
+        mm = total_min % 60
+        if mm == 0:
+            return f"{hh} hr"
+        return f"{hh} hr {mm} min"
 
     def wall_parts(self) -> tuple[int, int, int, int, int]:
         wall = self.sim_ms + FULDA_OFFSET_MS

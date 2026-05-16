@@ -150,6 +150,53 @@ html, body {
   font-variant-numeric: tabular-nums;
 }
 
+.timebar-controls {
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+
+.timebar-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: #3d4f66;
+}
+
+.timebar-step-label {
+  margin-right: 2px;
+  white-space: nowrap;
+}
+
+.timebar-step-value {
+  min-width: 1.5em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  color: #0a1628;
+}
+
+.timebar-step-btn {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+  font-weight: 600;
+  color: #1e3a5f;
+  background: #fff;
+  border: 1px solid rgba(15, 23, 42, 0.2);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.timebar-step-btn:hover {
+  background: rgba(30, 92, 179, 0.08);
+}
+
 .timebar-play {
   flex-shrink: 0;
   min-width: 88px;
@@ -525,6 +572,69 @@ html, body {
   pointer-events: auto;
 }
 
+.game-modal-panel--wide {
+  max-width: min(560px, 92vw);
+}
+
+.unit-info-body {
+  max-height: min(70vh, 520px);
+  overflow-y: auto;
+}
+
+.unit-info-section {
+  margin-bottom: 14px;
+}
+
+.unit-info-section:last-child {
+  margin-bottom: 0;
+}
+
+.unit-info-section h3 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #1e3a5f;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.unit-info-dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 12px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.unit-info-dl dt {
+  margin: 0;
+  color: #64748b;
+  font-weight: 600;
+}
+
+.unit-info-dl dd {
+  margin: 0;
+  color: #0f172a;
+}
+
+.unit-info-equip-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.unit-info-equip-table th,
+.unit-info-equip-table td {
+  padding: 4px 6px;
+  border: 1px solid rgba(15, 23, 42, 0.12);
+  text-align: left;
+}
+
+.unit-info-equip-table th {
+  background: rgba(30, 92, 179, 0.08);
+  font-weight: 600;
+}
+
 .game-modal-backdrop {
   position: absolute;
   inset: 0;
@@ -663,6 +773,24 @@ html, body {
   cursor: default;
   white-space: nowrap;
   user-select: none;
+}
+
+.order-bar-btn {
+  display: block;
+  width: 100%;
+  margin: 0;
+  padding: 8px 12px;
+  font: inherit;
+  font-weight: 600;
+  color: inherit;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.order-bar-btn:hover {
+  background: rgba(30, 92, 179, 0.1);
 }
 
 .order-bar-item--has-submenu:hover > .order-bar-label,

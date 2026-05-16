@@ -7,7 +7,14 @@ from typing import Any
 from backend.acquisition import AcquisitionEvent, AcquisitionService
 from backend.clock import ExerciseClock
 from backend.combat import UnitStatsCatalog, compute_combat_totals, parse_equipment_field
-from backend.config import PLAY_BOUNDS, ROOT
+from backend.config import (
+    DEFAULT_MINUTES_PER_STEP,
+    MINUTES_PER_STEP_MAX,
+    MINUTES_PER_STEP_MIN,
+    MP_PER_MINUTE,
+    PLAY_BOUNDS,
+    ROOT,
+)
 from backend.hex_grid import HexGrid
 from backend.indirect_fire import IndirectFireService
 from backend.movement_cost import MovementCostRaster
@@ -30,6 +37,7 @@ class GameState:
         self.acquisition = AcquisitionService(self.grid, self.zoc)
         self.indirect_fire = IndirectFireService(self.grid, self.catalog)
         self.clock = ExerciseClock()
+        self.minutes_per_step = DEFAULT_MINUTES_PER_STEP
         self.units: list[dict[str, Any]] = []
         self._acquisition_queue: list[AcquisitionEvent] = []
         self._acquisition_queue_dedup: set[tuple[str, str, str, str]] = set()
@@ -51,6 +59,7 @@ class GameState:
     def _make_unit(self, raw: dict, side: str) -> dict[str, Any]:
         specs = parse_equipment_field(raw.get("equipment") or "")
         totals = compute_combat_totals(specs, self.catalog)
+        pos_hex = self.grid.lat_lon_to_hex_key(raw["lat"], raw["lon"])
         return {
             "key": unit_key(side, raw["company"], raw["battalion"]),
             "company": raw["company"],
@@ -64,13 +73,20 @@ class GameState:
             "routeWaypointKeys": [],
             "routePath": None,
             "routeLegIndex": 0,
-            "accumMovePoints": 0,
+            "accumMovePoints": 0.0,
             "spotted": False,
             "equipmentSpecs": [{"name": s.name, "count": s.count} for s in specs],
             "totalDirectFire": totals.direct_fire,
             "totalIndirectFire": totals.indirect_fire,
             "totalCloseCombat": totals.close_combat,
+            "positionHexKey": pos_hex,
+            "positionSinceSimMs": self.clock.sim_ms,
         }
+
+    def _on_unit_hex_changed(self, u: dict[str, Any], new_hex_key: str) -> None:
+        if u.get("positionHexKey") != new_hex_key:
+            u["positionHexKey"] = new_hex_key
+            u["positionSinceSimMs"] = self.clock.sim_ms
 
     def get_unit(self, key: str) -> dict[str, Any] | None:
         for u in self.units:
@@ -87,7 +103,7 @@ class GameState:
             u["routeLegIndex"] = min(path.index(ck), len(path) - 1)
         else:
             u["routeLegIndex"] = 0
-            u["accumMovePoints"] = 0
+            u["accumMovePoints"] = 0.0
 
     def rebuild_route(self, u: dict[str, Any], reset_progress: bool) -> bool:
         if not u.get("destinationKey"):
@@ -103,7 +119,7 @@ class GameState:
         u["routePath"] = path
         if reset_progress:
             u["routeLegIndex"] = 0
-            u["accumMovePoints"] = 0
+            u["accumMovePoints"] = 0.0
         self.sync_leg_index(u)
         return True
 
@@ -113,7 +129,7 @@ class GameState:
         u["routeWaypointKeys"] = []
         u["routePath"] = None
         u["routeLegIndex"] = 0
-        u["accumMovePoints"] = 0
+        u["accumMovePoints"] = 0.0
 
     def assign_move_order(self, u: dict[str, Any], goal_key: str) -> str | None:
         if not self.raster.hex_has_raster(goal_key):
@@ -151,6 +167,7 @@ class GameState:
         self.clear_route(u)
         u["lat"] = lat
         u["lon"] = lon
+        self._on_unit_hex_changed(u, self.grid.lat_lon_to_hex_key(lat, lon))
 
     def remove_waypoint(self, u: dict[str, Any], index_in_intermediate: int) -> str | None:
         vias = u.get("routeWaypointKeys") or []
@@ -187,7 +204,7 @@ class GameState:
             return "Waypoint move breaks the route"
         return None
 
-    def advance_movement(self) -> list[AcquisitionEvent]:
+    def advance_movement_mp(self, mp_gain: float) -> list[AcquisitionEvent]:
         new_events: list[AcquisitionEvent] = []
         for u in self.units:
             if u["activity"] != "moving" or not u.get("routePath"):
@@ -196,7 +213,7 @@ class GameState:
             if u["routeLegIndex"] >= len(path) - 1:
                 self.clear_route(u)
                 continue
-            u["accumMovePoints"] += 1
+            u["accumMovePoints"] = float(u.get("accumMovePoints") or 0) + mp_gain
             guard = 0
             while guard < 48 and u["routeLegIndex"] < len(path) - 1:
                 guard += 1
@@ -212,6 +229,7 @@ class GameState:
                     lat, lon = self.grid.axial_center_lat_lon(a.q, a.r)
                     u["lat"] = lat
                     u["lon"] = lon
+                    self._on_unit_hex_changed(u, path[u["routeLegIndex"]])
                     evs = self.acquisition.check_hex_entry(
                         self.units, u, cur_key, nx_key, self._acquisition_queue_dedup
                     )
@@ -223,10 +241,16 @@ class GameState:
                     break
         return new_events
 
-    def sim_tick(self) -> dict[str, Any]:
-        self.clock.tick()
-        events = self.advance_movement()
-        for ev in events:
+    def sim_tick(self, minutes_per_step: int | None = None) -> dict[str, Any]:
+        steps = minutes_per_step if minutes_per_step is not None else self.minutes_per_step
+        steps = max(MINUTES_PER_STEP_MIN, min(MINUTES_PER_STEP_MAX, int(steps)))
+        self.minutes_per_step = steps
+        all_events: list[AcquisitionEvent] = []
+        for _ in range(steps):
+            self.clock.advance_minutes(1)
+            minute_events = self.advance_movement_mp(MP_PER_MINUTE)
+            all_events.extend(minute_events)
+        for ev in all_events:
             self._acquisition_queue.append(ev)
         tb = self.clock.timebar_strings()
         return {
@@ -234,7 +258,38 @@ class GameState:
             "simInstantMs": self.clock.sim_ms,
             "timebar": {"main": tb.main, "daynight": tb.daynight, "sunLine": tb.sun_line},
             "isDay": tb.is_day,
-            "newAcquisitionEvents": [asdict(e) for e in events],
+            "newAcquisitionEvents": [asdict(e) for e in all_events],
+            "minutesPerStep": self.minutes_per_step,
+            "mpPerMinute": MP_PER_MINUTE,
+        }
+
+    def unit_info(self, key: str) -> dict[str, Any] | None:
+        u = self.get_unit(key)
+        if not u:
+            return None
+        equipment: list[dict[str, Any]] = []
+        for spec in u.get("equipmentSpecs") or []:
+            st = self.catalog.get(spec["name"])
+            row: dict[str, Any] = {"name": spec["name"], "count": spec["count"]}
+            if st:
+                row["stats"] = {
+                    "movement": st.movement,
+                    "dfRange": st.df_range,
+                    "dfScore": st.df_score,
+                    "ifRange": st.if_range,
+                    "ifScore": st.if_score,
+                    "ccScore": st.cc_score,
+                }
+            equipment.append(row)
+        since = int(u.get("positionSinceSimMs") or self.clock.sim_ms)
+        duration_ms = max(0, self.clock.sim_ms - since)
+        return {
+            "unit": u,
+            "equipment": equipment,
+            "positionHexKey": u.get("positionHexKey"),
+            "positionSinceSimMs": since,
+            "timeInPositionMs": duration_ms,
+            "timeInPosition": ExerciseClock.format_duration(duration_ms),
         }
 
     def pop_acquisition_event(self) -> AcquisitionEvent | None:
@@ -338,7 +393,11 @@ class GameState:
                 "hexOriginLon": self.grid.origin_lon,
                 "playBounds": PLAY_BOUNDS,
                 "flatToFlatM": 1000,
-                "simTickMs": 5 * 60 * 1000,
+                "minuteMs": 60 * 1000,
+                "mpPerMinute": MP_PER_MINUTE,
+                "defaultMinutesPerStep": DEFAULT_MINUTES_PER_STEP,
+                "minutesPerStepMin": MINUTES_PER_STEP_MIN,
+                "minutesPerStepMax": MINUTES_PER_STEP_MAX,
             },
             "mvCost": {
                 "loaded": meta.loaded,
@@ -352,4 +411,6 @@ class GameState:
             "units": self.units,
             "simInstantMs": self.clock.sim_ms,
             "timebar": {"main": tb.main, "daynight": tb.daynight, "sunLine": tb.sun_line},
+            "minutesPerStep": self.minutes_per_step,
+            "mpPerMinute": MP_PER_MINUTE,
         }

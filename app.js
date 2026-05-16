@@ -95,6 +95,11 @@
   /** From /api/bootstrap */
   var mvCostMeta = { loaded: false };
   var selectionOverlayCache = null;
+  var MINUTE_MS = 60 * 1000;
+  var MP_PER_MINUTE = 0.2;
+  var minutesPerStep = 5;
+  var minutesPerStepMin = 1;
+  var minutesPerStepMax = 120;
 
   function getUnitByKey(key) {
     var i;
@@ -123,6 +128,8 @@
     u.totalDirectFire = su.totalDirectFire;
     u.totalIndirectFire = su.totalIndirectFire;
     u.totalCloseCombat = su.totalCloseCombat;
+    u.positionHexKey = su.positionHexKey;
+    u.positionSinceSimMs = su.positionSinceSimMs;
     return u;
   }
 
@@ -263,7 +270,6 @@
   var FULDA_SUN_LAT = 50.55;
   var FULDA_SUN_LON = 9.675;
   var FULDA_OFFSET_MS = 2 * 60 * 60 * 1000;
-  var SIM_TICK_MS = 5 * 60 * 1000;
   /** 1989-09-19 08:00 Fulda (+2) → UTC 06:00 */
   var simInstantMs = Date.UTC(1989, 8, 19, 6, 0, 0);
   var MONTH_ABBR = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
@@ -391,17 +397,47 @@
     if (elSu) elSu.textContent = s.sunLine;
   }
 
+  function updateMinutesPerStepDisplay() {
+    var el = document.getElementById('minutes-step-value');
+    if (el) el.textContent = String(minutesPerStep);
+  }
+
+  function clampMinutesPerStep(n) {
+    return Math.max(minutesPerStepMin, Math.min(minutesPerStepMax, n));
+  }
+
   (function initExerciseClockUI() {
     var playBtn = document.getElementById('timebar-play');
+    var decBtn = document.getElementById('minutes-step-dec');
+    var incBtn = document.getElementById('minutes-step-inc');
+    if (decBtn) {
+      decBtn.addEventListener('click', function (e) {
+        if (e && e.preventDefault) e.preventDefault();
+        minutesPerStep = clampMinutesPerStep(minutesPerStep - 1);
+        updateMinutesPerStepDisplay();
+      });
+    }
+    if (incBtn) {
+      incBtn.addEventListener('click', function (e) {
+        if (e && e.preventDefault) e.preventDefault();
+        minutesPerStep = clampMinutesPerStep(minutesPerStep + 1);
+        updateMinutesPerStepDisplay();
+      });
+    }
     if (playBtn) {
       playBtn.addEventListener('click', function (e) {
         if (e && e.preventDefault) e.preventDefault();
         if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
         if (acquisitionFlowActive) return;
-        GameApi.simTick()
+        GameApi.simTick({ minutes_per_step: minutesPerStep })
           .then(function (data) {
             applyServerUnits(data.units);
             updateTimebarFromApi(data.timebar, data.simInstantMs);
+            if (data.minutesPerStep != null) {
+              minutesPerStep = clampMinutesPerStep(data.minutesPerStep);
+              updateMinutesPerStepDisplay();
+            }
+            if (data.mpPerMinute != null) MP_PER_MINUTE = data.mpPerMinute;
             pushAcquisitionEventsFromApi(data.newAcquisitionEvents);
             syncBattalionAggregateMarkers();
             var uu;
@@ -411,6 +447,7 @@
             refreshMarkerDisplay();
             redrawHexGrid();
             updateMarkerClasses();
+            redrawRouteOverlay();
             beginAcquisitionFlowIfQueued();
           })
           .catch(function (err) {
@@ -419,6 +456,7 @@
           });
       });
     }
+    updateMinutesPerStepDisplay();
     updateTimebarDisplay();
   })();
 
@@ -785,37 +823,29 @@
     return v/14;
   }
 
-  /**
-   * Rounded MP cost; sub-unit positives (e.g. 0.4) snap to ≥ 1 MP. Zero/nodata rejects.
-   */
-  function mvCostRoundedAtLatLon(lat, lon) {
+  /** Exact MP cost from raster at lat/lon (no rounding). */
+  function mvCostAtLatLon(lat, lon) {
     var raw = rawMvCostAtLatLon(lat, lon);
     if (raw == null || !isFinite(Number(raw))) {
       return null;
     }
     var r = Number(raw);
-    if (r < 0) {
-      return null;
-    }
-    var n = Math.round(r);
-    if (n >= 1) {
-      return n;
-    }
-    if (r > 1e-6) {
-      return 1;
-    }
-    return null;
+    return r >= 0 ? r : null;
   }
 
-  function mvCostRoundedAtHexKey(hexKey) {
+  function mvCostAtHexKey(hexKey) {
     var qr = parseHexKey(hexKey);
     if (qr.some(isNaN)) return null;
     var ll = axialCenterLatLon(qr[0], qr[1]);
-    return mvCostRoundedAtLatLon(ll[0], ll[1]);
+    return mvCostAtLatLon(ll[0], ll[1]);
+  }
+
+  function mvCostRoundedAtHexKey(hexKey) {
+    return mvCostAtHexKey(hexKey);
   }
 
   function hexHasMvRaster(hexKey) {
-    return mvCostRoundedAtHexKey(hexKey) != null;
+    return mvCostAtHexKey(hexKey) != null;
   }
 
   /**
@@ -927,10 +957,7 @@
       });
   }
 
-  /**
-   * MP to enter the neighbour hex in direction dir (rounded mv_cost.tif at neighbour centre).
-   * Vehicle / day–night are ignored; cost comes only from the raster.
-   */
+  /** MP to enter neighbour hex (exact mv_cost.tif at neighbour centre). */
   function exitMoveCost(fromKey, dir, vehicle, isDay) {
     void vehicle;
     void isDay;
@@ -941,7 +968,15 @@
     if (!hexHasMvRaster(fromKey) || !hexHasMvRaster(nKey)) {
       return null;
     }
-    return mvCostRoundedAtHexKey(nKey);
+    return mvCostAtHexKey(nKey);
+  }
+
+  function segmentCostFromCache(sel, path, idx, segmentCosts) {
+    if (segmentCosts && segmentCosts[idx] != null && isFinite(segmentCosts[idx])) {
+      return segmentCosts[idx];
+    }
+    if (idx >= path.length - 1) return null;
+    return segmentMoveCost(path[idx], path[idx + 1], sel.vehicle, exerciseIsDay(simInstantMs));
   }
 
   function segmentMoveCost(fromKey, toKey, vehicle, isDay) {
@@ -1055,7 +1090,7 @@
       });
   }
 
-  function simulatePlayTicksToArrival(sel) {
+  function simulatePlayMinutesToArrival(sel, segmentCosts) {
     if (!sel.routePath || sel.routePath.length === 0) {
       return Infinity;
     }
@@ -1065,21 +1100,17 @@
     var path = sel.routePath;
     var idx = sel.routeLegIndex;
     var b = sel.accumMovePoints;
-    var ticks = 0;
+    var minutes = 0;
     var isDay = exerciseIsDay(simInstantMs);
     var safety = 0;
     while (idx < path.length - 1 && safety < 2500000) {
       safety++;
-      ticks += 1;
-      b += 1;
+      minutes += 1;
+      b += MP_PER_MINUTE;
       var guard = 0;
       while (guard < 48 && idx < path.length - 1) {
         guard += 1;
-        var curKey = path[idx];
-        var nxKey = path[idx + 1];
-        var di = directionIndexBetweenHexes(curKey, nxKey);
-        if (di < 0) return Infinity;
-        var cost = exitMoveCost(curKey, di, sel.vehicle, isDay);
+        var cost = segmentCostFromCache(sel, path, idx, segmentCosts);
         if (cost == null || !isFinite(cost)) return Infinity;
         if (b + 1e-9 >= cost) {
           b -= cost;
@@ -1092,15 +1123,15 @@
     if (idx < path.length - 1) {
       return Infinity;
     }
-    return ticks;
+    return minutes;
   }
 
-  function estimatedArrivalSimMs(sel) {
-    var ticks = simulatePlayTicksToArrival(sel);
-    if (!isFinite(ticks) || ticks < 0) {
+  function estimatedArrivalSimMs(sel, segmentCosts) {
+    var minutes = simulatePlayMinutesToArrival(sel, segmentCosts);
+    if (!isFinite(minutes) || minutes < 0) {
       return null;
     }
-    return simInstantMs + ticks * SIM_TICK_MS;
+    return simInstantMs + minutes * MINUTE_MS;
   }
 
   function axialCubeDistance(q1, r1, q2, r2) {
@@ -1116,7 +1147,7 @@
     var a = parseHexKey(fromKey);
     var b = parseHexKey(goalKey);
     var d = axialCubeDistance(a[0], a[1], b[0], b[1]);
-    var ck = mvCostRoundedAtHexKey(fromKey);
+    var ck = mvCostAtHexKey(fromKey);
     var mn = ck != null && ck > 0 && isFinite(ck) ? ck : 1;
     return d * mn;
   }
@@ -1771,13 +1802,21 @@
       }
     }
 
+    var slicePathKey = sliceKeys.join('|');
     GameApi.segmentCosts(sliceKeys)
       .then(function (data) {
+        sel._routeSegmentCosts = data.costs;
+        sel._routeSegmentCostsPath = slicePathKey;
         drawRouteSegments(data.costs);
+        if (destMkRef) {
+          updateRouteDestMarkerEta(sel, destMkRef, data.costs, sliceKeys);
+        }
       })
       .catch(function () {
         drawRouteSegments(null);
       });
+
+    var destMkRef;
 
     /** Intermediate waypoint handles */
     var wk;
@@ -1832,15 +1871,17 @@
       sliceKeys[sliceKeys.length - 1];
     var qd = parseHexKey(destKey);
     var destLL = axialCenterLatLon(qd[0], qd[1]);
-    var etaMs = estimatedArrivalSimMs(sel);
+    var cachedCosts =
+      sel._routeSegmentCostsPath === slicePathKey ? sel._routeSegmentCosts : null;
+    var etaMs = estimatedArrivalSimMs(sel, cachedCosts);
     var etaLine =
       etaMs != null ? formatExerciseMainLine(etaMs) : '(no ETA)';
-    var destMk = L.marker(L.latLng(destLL[0], destLL[1]), {
+    destMkRef = L.marker(L.latLng(destLL[0], destLL[1]), {
       draggable: true,
       pane: 'routePane',
       riseOnHover: true,
     });
-    destMk.setIcon(
+    destMkRef.setIcon(
       L.divIcon({
         className: 'route-dest-marker',
         html:
@@ -1859,11 +1900,38 @@
         iconAnchor: [18, 46],
       }),
     );
-    destMk.bindTooltip('Drag to move final destination');
-    destMk.on('dragend', function (ev2) {
+    destMkRef.bindTooltip('Drag to move final destination');
+    destMkRef.on('dragend', function (ev2) {
       applyWaypointMarkerDrag(sel, 'dest', -1, ev2.target.getLatLng());
     });
-    destMk.addTo(routeLayerGroup);
+    destMkRef.addTo(routeLayerGroup);
+  }
+
+  function updateRouteDestMarkerEta(sel, destMk, segmentCosts, sliceKeys) {
+    if (!destMk || !sel) return;
+    var etaMs = estimatedArrivalSimMs(sel, segmentCosts);
+    var etaLine = etaMs != null ? formatExerciseMainLine(etaMs) : '(no ETA)';
+    var icon = destMk.getIcon();
+    if (!icon || !icon.options) return;
+    destMk.setIcon(
+      L.divIcon({
+        className: icon.options.className || 'route-dest-marker',
+        html:
+          '<div class="route-dest-compact">' +
+          '<div class="route-dest-pushpin" title="Final destination"></div>' +
+          '<div class="route-dest-compact-text">' +
+          '<span class="route-dest-compact-co">' +
+          escapeHtmlLite(sel.company) +
+          '</span>' +
+          '<span class="route-dest-compact-eta">ETA ' +
+          escapeHtmlLite(etaLine) +
+          '</span>' +
+          '</div>' +
+          '</div>',
+        iconSize: icon.options.iconSize || [112, 52],
+        iconAnchor: icon.options.iconAnchor || [18, 46],
+      }),
+    );
   }
 
   function clearCompanyRoute(u) {
@@ -1981,21 +2049,17 @@
     redrawTerrainOverlay();
   }
 
-  function buildTerrainOverlayHtml(q, r, mvRounded, rawMv) {
+  function buildTerrainOverlayHtml(q, r, mv) {
     var key = q + ',' + r;
-    var rawTxt = rawMv != null && isFinite(Number(rawMv)) ? Number(rawMv).toFixed(3) : '—';
+    var mvTxt = mv != null && isFinite(Number(mv)) ? Number(mv).toFixed(2) : '—';
     return (
       '<div class="terrain-ov-card">' +
       '<div class="terrain-ov-coord">' +
       key +
       '</div>' +
       '<div class="terrain-ov-row">MP <strong>' +
-      mvRounded +
+      mvTxt +
       '</strong></div>' +
-      '<div class="terrain-ov-row terrain-ov-raw">' +
-      'raw ' +
-      rawTxt +
-      '</div>' +
       '</div>'
     );
   }
@@ -2015,7 +2079,7 @@
         var baseW = Math.max(56, Math.min(120, 44 + (z - 10) * 10));
         var baseH = Math.max(36, Math.min(68, 30 + (z - 10) * 5));
         (data.hexes || []).forEach(function (h) {
-          var html = buildTerrainOverlayHtml(h.q, h.r, h.mv_rounded, h.mv_raw);
+          var html = buildTerrainOverlayHtml(h.q, h.r, h.mv);
           var latlng = axialCenterLatLon(h.q, h.r);
           L.marker(L.latLng(latlng[0], latlng[1]), {
             pane: 'terrainOverlayPane',
@@ -2827,6 +2891,14 @@
       unitStatsByName = data.unitStats || {};
       syncMvCostMetaFromBootstrap(data.mvCost);
       if (data.simInstantMs != null) simInstantMs = data.simInstantMs;
+      if (cfg.minuteMs != null) MINUTE_MS = cfg.minuteMs;
+      if (cfg.mpPerMinute != null) MP_PER_MINUTE = cfg.mpPerMinute;
+      if (cfg.defaultMinutesPerStep != null) minutesPerStep = cfg.defaultMinutesPerStep;
+      if (cfg.minutesPerStepMin != null) minutesPerStepMin = cfg.minutesPerStepMin;
+      if (cfg.minutesPerStepMax != null) minutesPerStepMax = cfg.minutesPerStepMax;
+      if (data.minutesPerStep != null) minutesPerStep = data.minutesPerStep;
+      if (data.mpPerMinute != null) MP_PER_MINUTE = data.mpPerMinute;
+      updateMinutesPerStepDisplay();
       updateTimebarFromApi(data.timebar, data.simInstantMs);
       if (!data.mvCost || !data.mvCost.loaded) {
         var fr = (data.mvCost && data.mvCost.failureReason) || '';
@@ -3185,6 +3257,110 @@
     }
   }
 
+  function closeUnitInfoModal() {
+    var modal = document.getElementById('unit-info-modal');
+    if (modal) modal.hidden = true;
+  }
+
+  function buildUnitInfoHtml(data) {
+    var u = data.unit || {};
+    var esc = escapeHtmlLite;
+    var rows = [
+      ['Company', u.company],
+      ['Battalion', u.battalion],
+      ['Side', u.side],
+      ['Vehicle', u.vehicle],
+      ['Activity', u.activity],
+      ['Position hex', data.positionHexKey || '—'],
+      ['Time in position', data.timeInPosition || '—'],
+      ['Lat / Lon', u.lat != null ? u.lat.toFixed(5) + ', ' + u.lon.toFixed(5) : '—'],
+      ['Spotted', u.spotted ? 'Yes' : 'No'],
+      ['Direct fire', u.totalDirectFire],
+      ['Indirect fire', u.totalIndirectFire],
+      ['Close combat', u.totalCloseCombat],
+    ];
+    if (u.activity === 'moving' && u.destinationKey) {
+      rows.push(['Destination', u.destinationKey]);
+      rows.push(['Move points banked', u.accumMovePoints != null ? Number(u.accumMovePoints).toFixed(2) : '0']);
+    }
+    var html = '<section class="unit-info-section"><h3>Unit</h3><dl class="unit-info-dl">';
+    var ri;
+    for (ri = 0; ri < rows.length; ri++) {
+      html += '<dt>' + esc(String(rows[ri][0])) + '</dt><dd>' + esc(String(rows[ri][1])) + '</dd>';
+    }
+    html += '</dl></section>';
+    var equip = data.equipment || [];
+    html += '<section class="unit-info-section"><h3>Equipment</h3>';
+    if (!equip.length) {
+      html += '<p>None listed.</p>';
+    } else {
+      html +=
+        '<table class="unit-info-equip-table"><thead><tr>' +
+        '<th>Type</th><th>Qty</th><th>MV</th><th>DF rng</th><th>DF</th><th>IF rng</th><th>IF</th><th>CC</th>' +
+        '</tr></thead><tbody>';
+      var ei;
+      for (ei = 0; ei < equip.length; ei++) {
+        var eq = equip[ei];
+        var st = eq.stats || {};
+        html +=
+          '<tr><td>' +
+          esc(eq.name) +
+          '</td><td>' +
+          esc(String(eq.count)) +
+          '</td><td>' +
+          esc(st.movement != null ? String(st.movement) : '—') +
+          '</td><td>' +
+          esc(st.dfRange != null ? String(st.dfRange) : '—') +
+          '</td><td>' +
+          esc(st.dfScore != null ? String(st.dfScore) : '—') +
+          '</td><td>' +
+          esc(st.ifRange != null ? String(st.ifRange) : '—') +
+          '</td><td>' +
+          esc(st.ifScore != null ? String(st.ifScore) : '—') +
+          '</td><td>' +
+          esc(st.ccScore != null ? String(st.ccScore) : '—') +
+          '</td></tr>';
+      }
+      html += '</tbody></table>';
+    }
+    html += '</section>';
+    return html;
+  }
+
+  function openUnitInfoModal() {
+    if (!(selectionMode === 'company' && selectionCompanyKey)) {
+      setStatus('Select a company (double-click unit) for unit info.');
+      return;
+    }
+    var sel = getUnitByKey(selectionCompanyKey);
+    if (!sel) return;
+    var modal = document.getElementById('unit-info-modal');
+    var body = document.getElementById('unit-info-modal-body');
+    var title = document.getElementById('unit-info-modal-title');
+    if (!modal || !body) return;
+    body.innerHTML = '<p>Loading…</p>';
+    if (title) title.textContent = sel.company + ' — unit information';
+    modal.hidden = false;
+    GameApi.unitInfo(unitKey(sel.side, sel))
+      .then(function (data) {
+        mergeServerUnit(data.unit);
+        body.innerHTML = buildUnitInfoHtml(data);
+      })
+      .catch(function (err) {
+        body.innerHTML = '<p>Failed to load unit info: ' + escapeHtmlLite(err.message) + '</p>';
+      });
+  }
+
+  function initUnitInfoModal() {
+    var closeBtn = document.getElementById('unit-info-close');
+    var modal = document.getElementById('unit-info-modal');
+    if (closeBtn) closeBtn.addEventListener('click', closeUnitInfoModal);
+    if (modal) {
+      var backdrop = modal.querySelector('.game-modal-backdrop');
+      if (backdrop) backdrop.addEventListener('click', closeUnitInfoModal);
+    }
+  }
+
   function initOrderMenus() {
     var nav = document.getElementById('order-menus');
     if (!nav) return;
@@ -3198,6 +3374,10 @@
       if (!act) return;
       ev.preventDefault();
       ev.stopPropagation();
+      if (act === 'unit-info') {
+        openUnitInfoModal();
+        return;
+      }
       if (act === 'umpire-magic-move') {
         startMagicMove();
         return;
@@ -3230,6 +3410,7 @@
   }
 
   initIndirectFireModal();
+  initUnitInfoModal();
   initOrderMenus();
   initAcquisitionModalDrag();
 

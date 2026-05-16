@@ -65,7 +65,6 @@ class MovementCostRaster:
         if not (west <= lon <= east and south <= lat <= north):
             return None
         h, w = self._data.shape
-        # north-up: row 0 = north
         col = (lon - west) / (east - west) * (w - 1) if east > west else 0
         row = (north - lat) / (north - south) * (h - 1) if north > south else 0
         ci = int(round(col))
@@ -77,33 +76,26 @@ class MovementCostRaster:
             return None
         return val
 
-    def rounded_at_lat_lon(self, lat: float, lon: float) -> int | None:
+    def mv_at_lat_lon(self, lat: float, lon: float) -> float | None:
+        """Exact raster MP at hex centre (not rounded)."""
         raw = self._raw_at_lat_lon(lat, lon)
-        if raw is None:
+        if raw is None or raw < 0:
             return None
-        if raw < 0:
-            return None
-        n = int(round(raw))
-        if n >= 1:
-            return n
-        if raw > 1e-6:
-            return 1
-        return None
+        return raw
 
-    def rounded_at_hex_key(self, hex_key: str) -> int | None:
+    def mv_at_hex_key(self, hex_key: str) -> float | None:
         a = self.grid.parse_hex_key(hex_key)
         lat, lon = self.grid.axial_center_lat_lon(a.q, a.r)
-        return self.rounded_at_lat_lon(lat, lon)
+        return self.mv_at_lat_lon(lat, lon)
 
     def hex_has_raster(self, hex_key: str) -> bool:
-        return self.rounded_at_hex_key(hex_key) is not None
+        return self.mv_at_hex_key(hex_key) is not None
 
     def exit_move_cost(self, from_key: str, direction: int) -> float | None:
         n_key = self.grid.neighbor_key(from_key, direction)
         if not self.hex_has_raster(from_key) or not self.hex_has_raster(n_key):
             return None
-        cost = self.rounded_at_hex_key(n_key)
-        return float(cost) if cost is not None else None
+        return self.mv_at_hex_key(n_key)
 
     def segment_move_cost(self, from_key: str, to_key: str) -> float | None:
         di = self.grid.direction_index(from_key, to_key)
@@ -120,8 +112,8 @@ class MovementCostRaster:
         pad = FLAT_TO_FLAT_M * 2
         x_min = (west - grid.origin_lon) * scale_lon - pad
         x_max = (east - grid.origin_lon) * scale_lon + pad
-        y_min = (south - grid.origin_lat) * scale_lat - pad
-        y_max = (north - grid.origin_lat) * scale_lat + pad
+        y_min = (south - grid.origin_lat) * scale.lat - pad
+        y_max = (north - grid.origin_lat) * scale.lat + pad
         horiz = R_M * math.sqrt(3)
         vert = R_M * 1.5
         q_min = int(math.floor(x_min / horiz)) - 2
@@ -137,17 +129,15 @@ class MovementCostRaster:
                 lat, lon = grid.axial_center_lat_lon(q, r)
                 if not grid.hex_center_in_play(lat, lon, PLAY_BOUNDS):
                     continue
-                raw = self._raw_at_lat_lon(lat, lon)
-                rounded = self.rounded_at_lat_lon(lat, lon)
-                if rounded is None:
+                mv = self.mv_at_lat_lon(lat, lon)
+                if mv is None:
                     continue
                 out.append(
                     {
                         "key": grid.hex_key(q, r),
                         "q": q,
                         "r": r,
-                        "mv_rounded": rounded,
-                        "mv_raw": raw,
+                        "mv": mv,
                     }
                 )
         return out

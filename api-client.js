@@ -32,8 +32,15 @@
     state: function () {
       return jsonFetch('/api/state');
     },
-    simTick: function () {
-      return jsonFetch('/api/sim/tick', { method: 'POST' });
+    simTick: function (opts) {
+      return jsonFetch('/api/sim/tick', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts || {}),
+      });
+    },
+    unitInfo: function (unitKey) {
+      return jsonFetch('/api/units/' + enc(unitKey) + '/info');
     },
     moveOrder: function (unitKey, goalKey, extend) {
       return jsonFetch('/api/units/' + enc(unitKey) + '/move-order', {

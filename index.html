@@ -15,7 +15,15 @@
         <div id="timebar-daynight" class="timebar-sub">Night</div>
         <div id="timebar-sun" class="timebar-detail">Sunrise 06:42 · Sunset 19:08 · Sunrise in 05:20</div>
       </div>
-      <button type="button" id="timebar-play" class="timebar-play">Play</button>
+      <div class="timebar-controls">
+        <button type="button" id="timebar-play" class="timebar-play">Play</button>
+        <div class="timebar-step" aria-label="Minutes per play step">
+          <span class="timebar-step-label">min/step</span>
+          <button type="button" id="minutes-step-dec" class="timebar-step-btn" title="Fewer minutes per step" aria-label="Decrease minutes per step">−</button>
+          <span id="minutes-step-value" class="timebar-step-value">5</span>
+          <button type="button" id="minutes-step-inc" class="timebar-step-btn" title="More minutes per step" aria-label="Increase minutes per step">+</button>
+        </div>
+      </div>
     </div>
   </header>
   <nav id="order-menus" class="order-menus" hidden aria-label="Unit orders">
@@ -41,6 +49,9 @@
           <li><button type="button" class="order-leaf" data-action="enemy-assault">Assault</button></li>
         </ul>
       </li>
+      <li class="order-bar-item">
+        <button type="button" class="order-bar-btn order-leaf" data-action="unit-info">Unit info</button>
+      </li>
       <li class="order-bar-item order-bar-item--has-submenu">
         <span class="order-bar-label" tabindex="0">Umpire</span>
         <ul class="order-dropdown order-dropdown--1" role="menu">
@@ -50,7 +61,7 @@
     </ul>
   </nav>
   <div id="map"></div>
-  <button type="button" id="terrain-overlay-toggle" class="terrain-overlay-toggle" aria-pressed="false" title="Toggle hex overlay (rounded MP from mv_cost.tif)">Terrain</button>
+  <button type="button" id="terrain-overlay-toggle" class="terrain-overlay-toggle" aria-pressed="false" title="Toggle hex overlay (MP from mv_cost.tif)">Terrain</button>
   <div id="legend">
     <strong>Selection</strong>
     <p id="selection-status">No selection</p>
@@ -73,6 +84,16 @@
       <div id="spotreport-modal-body" class="game-modal-body"></div>
       <div class="game-modal-actions">
         <button type="button" id="spotreport-ok" class="game-modal-btn game-modal-btn--primary">OK</button>
+      </div>
+    </div>
+  </div>
+  <div id="unit-info-modal" class="game-modal" role="dialog" aria-modal="true" aria-labelledby="unit-info-modal-title" hidden>
+    <div class="game-modal-backdrop"></div>
+    <div class="game-modal-panel game-modal-panel--wide">
+      <h2 id="unit-info-modal-title" class="game-modal-title">Unit information</h2>
+      <div id="unit-info-modal-body" class="game-modal-body unit-info-body"></div>
+      <div class="game-modal-actions">
+        <button type="button" id="unit-info-close" class="game-modal-btn game-modal-btn--primary">Close</button>
       </div>
     </div>
   </div>

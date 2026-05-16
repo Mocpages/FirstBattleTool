@@ -20,8 +20,8 @@ class Pathfinder:
         a = self.grid.parse_hex_key(from_key)
         b = self.grid.parse_hex_key(goal_key)
         d = self.grid.axial_distance(a.q, a.r, b.q, b.r)
-        ck = self.raster.rounded_at_hex_key(from_key)
-        mn = ck if ck is not None and ck > 0 else 1
+        ck = self.raster.mv_at_hex_key(from_key)
+        mn = ck if ck is not None and ck > 0 else 1.0
         return d * mn
 
     def find_route(self, start_key: str, goal_key: str) -> list[str] | None:

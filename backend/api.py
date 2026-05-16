@@ -1,7 +1,7 @@
 """FastAPI HTTP API for game simulation."""
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -76,6 +76,10 @@ class PathBody(BaseModel):
     path: list[str] = Field(default_factory=list)
 
 
+class SimTickBody(BaseModel):
+    minutes_per_step: Optional[int] = None
+
+
 @app.get("/api/bootstrap")
 def bootstrap() -> dict[str, Any]:
     return game.bootstrap()
@@ -93,8 +97,17 @@ def state() -> dict[str, Any]:
 
 
 @app.post("/api/sim/tick")
-def sim_tick() -> dict[str, Any]:
-    return game.sim_tick()
+def sim_tick(body: Optional[SimTickBody] = None) -> dict[str, Any]:
+    minutes = body.minutes_per_step if body else None
+    return game.sim_tick(minutes)
+
+
+@app.get("/api/units/{unit_key}/info")
+def unit_info(unit_key: str) -> dict[str, Any]:
+    info = game.unit_info(unit_key)
+    if not info:
+        raise HTTPException(404, "Unit not found")
+    return info
 
 
 @app.get("/api/acquisition/queue")
