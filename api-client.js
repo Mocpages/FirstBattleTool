@@ -122,12 +122,29 @@
     indirectFireCandidates: function (targetKey) {
       return jsonFetch('/api/indirect-fire/candidates?target_key=' + enc(targetKey));
     },
+    indirectFireTimeToFire: function (firingRows) {
+      return jsonFetch('/api/indirect-fire/time-to-fire', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ firing_rows: firingRows }),
+      });
+    },
     indirectFireResolve: function (body) {
       return jsonFetch('/api/indirect-fire/resolve', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
+    },
+    ifMissionPlan: function (body) {
+      return jsonFetch('/api/indirect-fire/mission/plan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    },
+    reportsPop: function () {
+      return jsonFetch('/api/reports/pop', { method: 'POST' });
     },
   };
 

@@ -5,6 +5,7 @@ from dataclasses import asdict
 from typing import Any
 
 from backend.acquisition import AcquisitionEvent, AcquisitionService
+from backend.artillery_fire import tick_exhaustion_recovery, time_in_position_ms
 from backend.clock import ExerciseClock
 from backend.combat import UnitStatsCatalog, compute_combat_totals, parse_equipment_field
 from backend.config import (
@@ -16,8 +17,10 @@ from backend.config import (
     ROOT,
 )
 from backend.hex_grid import HexGrid
+from backend.if_mission import IFMissionManager
 from backend.indirect_fire import IndirectFireService
 from backend.movement_cost import MovementCostRaster
+from backend.reports import ReportService
 from backend.pathfinding import Pathfinder
 from backend.unit_loader import load_unit_csv
 from backend.zone_control import ZoneOfControlService
@@ -36,11 +39,14 @@ class GameState:
         self.catalog = UnitStatsCatalog()
         self.acquisition = AcquisitionService(self.grid, self.zoc)
         self.indirect_fire = IndirectFireService(self.grid, self.catalog)
+        self.reports = ReportService()
+        self.if_mission = IFMissionManager(self.catalog, self.reports)
         self.clock = ExerciseClock()
         self.minutes_per_step = DEFAULT_MINUTES_PER_STEP
         self.units: list[dict[str, Any]] = []
         self._acquisition_queue: list[AcquisitionEvent] = []
         self._acquisition_queue_dedup: set[tuple[str, str, str, str]] = set()
+        self._report_queue: list[dict[str, Any]] = []
 
     def initialize(self) -> None:
         self.catalog.load_csv()
@@ -81,12 +87,19 @@ class GameState:
             "totalCloseCombat": totals.close_combat,
             "positionHexKey": pos_hex,
             "positionSinceSimMs": self.clock.sim_ms,
+            "ifExhausted": False,
+            "ifCeaseFireSimMs": None,
         }
 
+    def _set_unit_halted(self, u: dict[str, Any], hex_key: str | None = None) -> None:
+        u["activity"] = "halted"
+        if hex_key is None:
+            hex_key = self.grid.lat_lon_to_hex_key(u["lat"], u["lon"])
+        u["positionHexKey"] = hex_key
+        u["positionSinceSimMs"] = self.clock.sim_ms
+
     def _on_unit_hex_changed(self, u: dict[str, Any], new_hex_key: str) -> None:
-        if u.get("positionHexKey") != new_hex_key:
-            u["positionHexKey"] = new_hex_key
-            u["positionSinceSimMs"] = self.clock.sim_ms
+        u["positionHexKey"] = new_hex_key
 
     def get_unit(self, key: str) -> dict[str, Any] | None:
         for u in self.units:
@@ -124,12 +137,12 @@ class GameState:
         return True
 
     def clear_route(self, u: dict[str, Any]) -> None:
-        u["activity"] = "halted"
         u["destinationKey"] = None
         u["routeWaypointKeys"] = []
         u["routePath"] = None
         u["routeLegIndex"] = 0
         u["accumMovePoints"] = 0.0
+        self._set_unit_halted(u)
 
     def assign_move_order(self, u: dict[str, Any], goal_key: str) -> str | None:
         if not self.raster.hex_has_raster(goal_key):
@@ -164,10 +177,14 @@ class GameState:
         return None
 
     def magic_move(self, u: dict[str, Any], lat: float, lon: float) -> None:
-        self.clear_route(u)
+        u["destinationKey"] = None
+        u["routeWaypointKeys"] = []
+        u["routePath"] = None
+        u["routeLegIndex"] = 0
+        u["accumMovePoints"] = 0.0
         u["lat"] = lat
         u["lon"] = lon
-        self._on_unit_hex_changed(u, self.grid.lat_lon_to_hex_key(lat, lon))
+        self._set_unit_halted(u, self.grid.lat_lon_to_hex_key(lat, lon))
 
     def remove_waypoint(self, u: dict[str, Any], index_in_intermediate: int) -> str | None:
         vias = u.get("routeWaypointKeys") or []
@@ -246,22 +263,68 @@ class GameState:
         steps = max(MINUTES_PER_STEP_MIN, min(MINUTES_PER_STEP_MAX, int(steps)))
         self.minutes_per_step = steps
         all_events: list[AcquisitionEvent] = []
+        if_reports: list[dict[str, Any]] = []
         for _ in range(steps):
+            tick_exhaustion_recovery(self.units, self.clock.sim_ms)
             self.clock.advance_minutes(1)
+            tick_exhaustion_recovery(self.units, self.clock.sim_ms)
             minute_events = self.advance_movement_mp(MP_PER_MINUTE)
             all_events.extend(minute_events)
+            if_tick = self._tick_if_mission_minute()
+            if_reports.extend(if_tick.get("reports") or [])
         for ev in all_events:
             self._acquisition_queue.append(ev)
+        for rep in if_reports:
+            self._report_queue.append(rep)
         tb = self.clock.timebar_strings()
+        mission = self.if_mission.get_mission()
         return {
             "units": self.units,
             "simInstantMs": self.clock.sim_ms,
             "timebar": {"main": tb.main, "daynight": tb.daynight, "sunLine": tb.sun_line},
             "isDay": tb.is_day,
             "newAcquisitionEvents": [asdict(e) for e in all_events],
+            "newReports": if_reports,
+            "activeIfMission": mission.to_api_dict() if mission else None,
             "minutesPerStep": self.minutes_per_step,
             "mpPerMinute": MP_PER_MINUTE,
         }
+
+    def _tick_if_mission_minute(self) -> dict[str, Any]:
+        return self.if_mission.tick_minute(
+            self.units,
+            self.clock.sim_ms,
+            ExerciseClock.format_main_line_at,
+            self._mgrs_six_digit,
+        )
+
+    def start_if_mission(
+        self,
+        target_key: str,
+        firing_rows: list[dict[str, Any]],
+        preplanned: bool,
+        dug_in: bool,
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        err, _ = self.if_mission.start_mission(
+            self.units,
+            target_key,
+            firing_rows,
+            preplanned,
+            dug_in,
+            self.clock.sim_ms,
+        )
+        return err, []
+
+    def sync_if_mission_plan(self, firing_rows: list[dict[str, Any]]) -> str | None:
+        return self.if_mission.sync_firing_plan(self.units, firing_rows, self.clock.sim_ms)
+
+    def pop_report(self) -> dict[str, Any] | None:
+        if not self._report_queue:
+            return None
+        return self._report_queue.pop(0)
+
+    def report_queue_length(self) -> int:
+        return len(self._report_queue)
 
     def unit_info(self, key: str) -> dict[str, Any] | None:
         u = self.get_unit(key)
@@ -270,6 +333,7 @@ class GameState:
         equipment: list[dict[str, Any]] = []
         for spec in u.get("equipmentSpecs") or []:
             st = self.catalog.get(spec["name"])
+            art = self.catalog.get_artillery(spec["name"])
             row: dict[str, Any] = {"name": spec["name"], "count": spec["count"]}
             if st:
                 row["stats"] = {
@@ -280,9 +344,16 @@ class GameState:
                     "ifScore": st.if_score,
                     "ccScore": st.cc_score,
                 }
+            if art:
+                row["artillery"] = {
+                    "emplacementTimeMin": art.emplacement_time_min,
+                    "displacementTimeMin": art.displacement_time_min,
+                    "maxRateOfFirePerTube": art.max_rate_of_fire,
+                    "sustainedRateOfFirePerTube": art.sustained_rate_of_fire,
+                }
             equipment.append(row)
-        since = int(u.get("positionSinceSimMs") or self.clock.sim_ms)
-        duration_ms = max(0, self.clock.sim_ms - since)
+        duration_ms = time_in_position_ms(u, self.clock.sim_ms)
+        since = u.get("positionSinceSimMs") if u.get("activity") == "halted" else None
         return {
             "unit": u,
             "equipment": equipment,
@@ -290,6 +361,7 @@ class GameState:
             "positionSinceSimMs": since,
             "timeInPositionMs": duration_ms,
             "timeInPosition": ExerciseClock.format_duration(duration_ms),
+            "ifExhausted": bool(u.get("ifExhausted")),
         }
 
     def pop_acquisition_event(self) -> AcquisitionEvent | None:
@@ -408,9 +480,16 @@ class GameState:
                 "failureReason": meta.failure_reason,
             },
             "unitStats": self.catalog.to_api_dict(),
+            "maneuverStats": self.catalog.maneuver_to_api_dict(),
+            "artilleryStats": self.catalog.artillery_to_api_dict(),
             "units": self.units,
             "simInstantMs": self.clock.sim_ms,
             "timebar": {"main": tb.main, "daynight": tb.daynight, "sunLine": tb.sun_line},
             "minutesPerStep": self.minutes_per_step,
             "mpPerMinute": MP_PER_MINUTE,
+            "activeIfMission": (
+                self.if_mission.get_mission().to_api_dict()
+                if self.if_mission.get_mission()
+                else None
+            ),
         }

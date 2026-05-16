@@ -4,6 +4,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from backend.artillery_fire import (
+    compute_time_to_fire,
+    is_artillery_emplaced,
+    time_in_position_minutes,
+)
 from backend.combat import UnitStatsCatalog, format_score
 from backend.hex_grid import HexGrid
 
@@ -15,6 +20,11 @@ class IFWeaponOption:
     if_range: float
     if_score: float
     dist_km: float
+    emplacement_time_min: float
+    emplaced: bool
+    can_fire: bool
+    exhausted: bool
+    time_in_position_min: float
 
 
 @dataclass
@@ -24,6 +34,8 @@ class IFCandidateGroup:
     battalion: str
     side: str
     weapons: list[IFWeaponOption]
+    activity: str
+    time_in_position_min: float
 
 
 class IndirectFireService:
@@ -31,27 +43,39 @@ class IndirectFireService:
         self.grid = grid
         self.catalog = catalog
 
-    def candidate_groups(self, units: list[dict[str, Any]], target: dict[str, Any]) -> list[IFCandidateGroup]:
+    def candidate_groups(
+        self,
+        units: list[dict[str, Any]],
+        target: dict[str, Any],
+        sim_ms: int,
+    ) -> list[IFCandidateGroup]:
         enemy_side = "red" if target["side"] == "blue" else "blue"
         groups: list[IFCandidateGroup] = []
         for u in units:
             if u["side"] != enemy_side:
                 continue
             weapons: list[IFWeaponOption] = []
+            tip = time_in_position_minutes(u, sim_ms)
             for spec in u.get("equipmentSpecs") or []:
-                st = self.catalog.get(spec["name"])
-                if not st or st.if_score <= 0:
+                art = self.catalog.get_artillery(spec["name"])
+                if not art or art.if_score <= 0:
                     continue
                 d_km = self.grid.distance_km(u["lat"], u["lon"], target["lat"], target["lon"])
-                if st.if_range < d_km:
+                if art.if_range < d_km:
                     continue
+                emplaced = is_artillery_emplaced(u, art, sim_ms)
                 weapons.append(
                     IFWeaponOption(
                         name=spec["name"],
                         count=spec["count"],
-                        if_range=st.if_range,
-                        if_score=st.if_score,
+                        if_range=art.if_range,
+                        if_score=art.if_score,
                         dist_km=d_km,
+                        emplacement_time_min=art.emplacement_time_min,
+                        emplaced=emplaced,
+                        can_fire=emplaced,
+                        exhausted=bool(u.get("ifExhausted")),
+                        time_in_position_min=tip,
                     )
                 )
             if weapons:
@@ -62,9 +86,24 @@ class IndirectFireService:
                         battalion=u["battalion"],
                         side=u["side"],
                         weapons=weapons,
+                        activity=u.get("activity") or "halted",
+                        time_in_position_min=tip,
                     )
                 )
         return groups
+
+    def time_to_fire_for_row(
+        self,
+        unit: dict[str, Any],
+        weapon_name: str,
+        tube_count: int,
+        rounds_per_tube: int,
+        sim_ms: int,
+    ) -> dict[str, Any] | None:
+        art = self.catalog.get_artillery(weapon_name)
+        if not art:
+            return None
+        return compute_time_to_fire(unit, art, tube_count, rounds_per_tube, sim_ms)
 
     def resolve_total_score(
         self,

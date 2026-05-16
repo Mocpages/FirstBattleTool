@@ -1,0 +1,2 @@
+name,movement,direct_fire_range,direct_fire_score,indirect_fire_range,indirect_fire_score,close_combat_score,emplacement_time_min,displacement_time_min,max_rate_of_fire,sustained_rate_of_fire,arty_type,is_hard_target
+2S1,6,4,0.5,15,0.05,0.3,5,2,8,2,light artillery,false

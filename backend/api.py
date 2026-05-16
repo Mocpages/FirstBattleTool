@@ -72,6 +72,24 @@ class IndirectFireResolveBody(BaseModel):
     dug_in: bool = False
 
 
+class IFTimeToFireRow(BaseModel):
+    unit_key: str
+    weapon_name: str
+    tube_count: int
+    rounds: int = 1
+
+
+class IFTimeToFireBody(BaseModel):
+    firing_rows: list[IFTimeToFireRow]
+
+
+class IFMissionPlanBody(BaseModel):
+    target_key: str
+    firing_rows: list[IFTimeToFireRow]
+    preplanned: bool = False
+    dug_in: bool = False
+
+
 class PathBody(BaseModel):
     path: list[str] = Field(default_factory=list)
 
@@ -209,15 +227,18 @@ def if_candidates(target_key: str) -> dict[str, Any]:
     target = game.get_unit(target_key)
     if not target:
         raise HTTPException(404, "Target not found")
-    groups = game.indirect_fire.candidate_groups(game.units, target)
+    groups = game.indirect_fire.candidate_groups(game.units, target, game.clock.sim_ms)
     return {
         "targetKey": target_key,
+        "simInstantMs": game.clock.sim_ms,
         "groups": [
             {
                 "unitKey": g.unit_key,
                 "company": g.company,
                 "battalion": g.battalion,
                 "side": g.side,
+                "activity": g.activity,
+                "timeInPositionMin": g.time_in_position_min,
                 "weapons": [
                     {
                         "name": w.name,
@@ -225,6 +246,11 @@ def if_candidates(target_key: str) -> dict[str, Any]:
                         "ifRange": w.if_range,
                         "ifScore": w.if_score,
                         "distKm": w.dist_km,
+                        "emplacementTimeMin": w.emplacement_time_min,
+                        "emplaced": w.emplaced,
+                        "canFire": w.can_fire,
+                        "exhausted": w.exhausted,
+                        "timeInPositionMin": w.time_in_position_min,
                     }
                     for w in g.weapons
                 ],
@@ -234,21 +260,107 @@ def if_candidates(target_key: str) -> dict[str, Any]:
     }
 
 
-@app.post("/api/indirect-fire/resolve")
-def if_resolve(body: IndirectFireResolveBody) -> dict[str, Any]:
-    rows = [
+@app.post("/api/indirect-fire/time-to-fire")
+def if_time_to_fire(body: IFTimeToFireBody) -> dict[str, Any]:
+    rows_out = []
+    for row in body.firing_rows:
+        u = game.get_unit(row.unit_key)
+        if not u:
+            raise HTTPException(404, f"Unit not found: {row.unit_key}")
+        ttf = game.indirect_fire.time_to_fire_for_row(
+            u,
+            row.weapon_name,
+            row.tube_count,
+            row.rounds,
+            game.clock.sim_ms,
+        )
+        if not ttf:
+            raise HTTPException(400, f"Not artillery: {row.weapon_name}")
+        rows_out.append(
+            {
+                "unitKey": row.unit_key,
+                "weaponName": row.weapon_name,
+                **ttf,
+            }
+        )
+    return {"rows": rows_out}
+
+
+def _if_api_rows(firing_rows: list) -> list[dict[str, Any]]:
+    return [
         {
+            "unit_key": r.unit_key,
+            "weapon_name": r.weapon_name,
+            "tube_count": r.tube_count,
+            "rounds": r.rounds,
+            "if_score": r.if_score,
             "tubeCount": r.tube_count,
             "ifScore": r.if_score,
-            "rounds": r.rounds,
             "company": (game.get_unit(r.unit_key) or {}).get("company", ""),
             "weaponName": r.weapon_name,
         }
-        for r in body.firing_rows
+        for r in firing_rows
     ]
-    total = game.indirect_fire.resolve_total_score(rows, body.preplanned, body.dug_in)
-    msg = game.indirect_fire.format_mission_status(rows, total, body.preplanned, body.dug_in)
-    return {"ok": True, "totalScore": total, "message": msg}
+
+
+@app.post("/api/indirect-fire/resolve")
+def if_resolve(body: IndirectFireResolveBody) -> dict[str, Any]:
+    api_rows = _if_api_rows(body.firing_rows)
+    err, _ = game.start_if_mission(
+        body.target_key,
+        api_rows,
+        body.preplanned,
+        body.dug_in,
+    )
+    if err:
+        raise HTTPException(400, err)
+    mission = game.if_mission.get_mission()
+    total = game.indirect_fire.resolve_total_score(api_rows, body.preplanned, body.dug_in)
+    return {
+        "ok": True,
+        "totalScore": total,
+        "message": "Indirect fire mission started. Advance time with Play to fire.",
+        "units": game.units,
+        "activeIfMission": mission.to_api_dict() if mission else None,
+    }
+
+
+@app.post("/api/indirect-fire/mission/plan")
+def if_mission_plan(body: IFMissionPlanBody) -> dict[str, Any]:
+    api_rows = _if_api_rows(body.firing_rows)
+    mission = game.if_mission.get_mission()
+    if mission and mission.is_active():
+        err = game.sync_if_mission_plan(api_rows)
+        if err:
+            raise HTTPException(400, err)
+    else:
+        err, _ = game.start_if_mission(
+            body.target_key,
+            api_rows,
+            body.preplanned,
+            body.dug_in,
+        )
+        if err:
+            raise HTTPException(400, err)
+    mission = game.if_mission.get_mission()
+    return {
+        "ok": True,
+        "activeIfMission": mission.to_api_dict() if mission else None,
+        "units": game.units,
+    }
+
+
+@app.get("/api/reports/queue")
+def reports_queue() -> dict[str, Any]:
+    return {"length": game.report_queue_length()}
+
+
+@app.post("/api/reports/pop")
+def reports_pop() -> dict[str, Any]:
+    rep = game.pop_report()
+    if not rep:
+        return {"report": None}
+    return {"report": rep}
 
 
 # Static files (index.html, app.js, …) — mount last

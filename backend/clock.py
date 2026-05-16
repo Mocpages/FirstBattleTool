@@ -46,9 +46,14 @@ class ExerciseClock:
         return d.year, d.month, d.day, d.hour, d.minute
 
     def format_main_line(self) -> str:
-        y, mo, day, hh, mm = self.wall_parts()
-        yy = y % 100
-        return f"{hh:02d}{mm:02d} {day}{MONTH_ABBR[mo - 1]}{yy:02d}"
+        return self.format_main_line_at(self.sim_ms)
+
+    @staticmethod
+    def format_main_line_at(sim_ms: int) -> str:
+        wall = sim_ms + FULDA_OFFSET_MS
+        d = datetime.fromtimestamp(wall / 1000, tz=timezone.utc)
+        yy = d.year % 100
+        return f"{d.hour:02d}{d.minute:02d} {d.day}{MONTH_ABBR[d.month - 1]}{yy:02d}"
 
     def _solar_times_approx(self, y: int, mo: int, day: int) -> tuple[int, int]:
         """Approximate sunrise/sunset UTC ms for Fulda (September typical)."""

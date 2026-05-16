@@ -70,6 +70,7 @@
   var units = [];
   /** @type {Object.<string, { movement: number, dfRange: number, dfScore: number, ifRange: number, ifScore: number, ccScore: number }>} */
   var unitStatsByName = {};
+  var artilleryStatsByName = {};
   /** @type {Object.<string, L.Marker>} */
   var markerByKey = {};
   /**
@@ -91,6 +92,9 @@
   /** @type {{ spotter: Unit, target: Unit, enteredHexKey: string, fromHexKey: string, spotKind?: string }[]} */
   var acquisitionQueue = [];
   var acquisitionFlowActive = false;
+  var reportQueue = [];
+  var reportFlowActive = false;
+  var activeIfMission = null;
 
   /** From /api/bootstrap */
   var mvCostMeta = { loaded: false };
@@ -130,6 +134,8 @@
     u.totalCloseCombat = su.totalCloseCombat;
     u.positionHexKey = su.positionHexKey;
     u.positionSinceSimMs = su.positionSinceSimMs;
+    u.ifExhausted = su.ifExhausted;
+    u.ifCeaseFireSimMs = su.ifCeaseFireSimMs;
     return u;
   }
 
@@ -439,6 +445,9 @@
             }
             if (data.mpPerMinute != null) MP_PER_MINUTE = data.mpPerMinute;
             pushAcquisitionEventsFromApi(data.newAcquisitionEvents);
+            pushReportsFromApi(data.newReports);
+            if (data.activeIfMission != null) activeIfMission = data.activeIfMission;
+            updateIfMissionStatusLine();
             syncBattalionAggregateMarkers();
             var uu;
             for (uu = 0; uu < units.length; uu++) {
@@ -1541,6 +1550,53 @@
       '</p>' +
       '<p><strong>Equipment:</strong> </p>';
     modal.hidden = false;
+  }
+
+  function showGameReportModal(report) {
+    var body = document.getElementById('spotreport-modal-body');
+    var titleEl = document.getElementById('spotreport-modal-title');
+    var modal = document.getElementById('spotreport-modal');
+    if (!body || !modal || !report) return;
+    if (titleEl) titleEl.textContent = report.title || 'Message';
+    var text = report.text || '';
+    body.innerHTML = '<pre class="game-report-text">' + escapeHtmlLite(text) + '</pre>';
+    modal.hidden = false;
+  }
+
+  function beginReportFlowIfQueued() {
+    if (reportFlowActive || !reportQueue.length) return;
+    reportFlowActive = true;
+    showNextQueuedReport();
+  }
+
+  function showNextQueuedReport() {
+    if (!reportQueue.length) {
+      reportFlowActive = false;
+      hideSpotReportModal();
+      return;
+    }
+    var rep = reportQueue.shift();
+    showGameReportModal(rep);
+    var okBtn = document.getElementById('spotreport-ok');
+    function onOk() {
+      if (okBtn) okBtn.removeEventListener('click', onOk);
+      hideSpotReportModal();
+      if (reportQueue.length) {
+        showNextQueuedReport();
+      } else {
+        reportFlowActive = false;
+      }
+    }
+    if (okBtn) okBtn.addEventListener('click', onOk);
+  }
+
+  function pushReportsFromApi(reports) {
+    if (!reports || !reports.length) return;
+    var i;
+    for (i = 0; i < reports.length; i++) {
+      reportQueue.push(reports[i]);
+    }
+    beginReportFlowIfQueued();
   }
 
   function showSpotReportFromApi(report) {
@@ -2888,7 +2944,8 @@
       var cfg = data.config || {};
       if (cfg.hexOriginLat != null) hexOriginLat = cfg.hexOriginLat;
       if (cfg.hexOriginLon != null) hexOriginLon = cfg.hexOriginLon;
-      unitStatsByName = data.unitStats || {};
+      unitStatsByName = data.unitStats || data.maneuverStats || {};
+      artilleryStatsByName = data.artilleryStats || {};
       syncMvCostMetaFromBootstrap(data.mvCost);
       if (data.simInstantMs != null) simInstantMs = data.simInstantMs;
       if (cfg.minuteMs != null) MINUTE_MS = cfg.minuteMs;
@@ -2898,8 +2955,10 @@
       if (cfg.minutesPerStepMax != null) minutesPerStepMax = cfg.minutesPerStepMax;
       if (data.minutesPerStep != null) minutesPerStep = data.minutesPerStep;
       if (data.mpPerMinute != null) MP_PER_MINUTE = data.mpPerMinute;
+      if (data.activeIfMission != null) activeIfMission = data.activeIfMission;
       updateMinutesPerStepDisplay();
       updateTimebarFromApi(data.timebar, data.simInstantMs);
+      updateIfMissionStatusLine();
       if (!data.mvCost || !data.mvCost.loaded) {
         var fr = (data.mvCost && data.mvCost.failureReason) || '';
         setStatus(
@@ -2933,7 +2992,27 @@
     target: null,
     candidateGroups: [],
     firingRows: [],
+    active: false,
   };
+  var IF_DEFAULT_ROUNDS = 10;
+
+  function parseIndirectFireRounds(val) {
+    var n = parseInt(String(val).trim(), 10);
+    if (!isFinite(n) || n < 1) return 1;
+    return n;
+  }
+
+  function getIndirectFireRoundsInput(wrap, rowIndex) {
+    if (!wrap) return null;
+    return wrap.querySelector('input.if-rounds-input[data-row-index="' + rowIndex + '"]');
+  }
+
+  function getIndirectFireRoundsForRow(wrap, rowIndex, row) {
+    var inp = getIndirectFireRoundsInput(wrap, rowIndex);
+    if (inp) return parseIndirectFireRounds(inp.value);
+    if (row && row.rounds != null) return parseIndirectFireRounds(row.rounds);
+    return IF_DEFAULT_ROUNDS;
+  }
 
   function getSelectedCompanyUnit() {
     if (!(selectionMode === 'company' && selectionCompanyKey)) return null;
@@ -2978,6 +3057,53 @@
     indirectFireMission.target = null;
     indirectFireMission.candidateGroups = [];
     indirectFireMission.firingRows = [];
+    indirectFireMission.active = false;
+    updateIfMissionStatusLine();
+  }
+
+  function updateIfMissionStatusLine() {
+    var line = document.getElementById('if-mission-status');
+    if (!line) return;
+    if (activeIfMission && activeIfMission.active) {
+      line.hidden = false;
+      line.textContent =
+        'Mission in progress — ' +
+        (activeIfMission.totalRoundsFired || 0) +
+        ' rounds fired. Use Play to advance. Update plan with FIRE.';
+    } else if (activeIfMission && !activeIfMission.active && activeIfMission.endedSimMs) {
+      line.hidden = false;
+      line.textContent = 'Last mission complete. SHELREP issued if applicable.';
+    } else {
+      line.hidden = true;
+      line.textContent = '';
+    }
+  }
+
+  function buildIfMissionPayload() {
+    var wrap = document.getElementById('if-selected-rows');
+    var chkP = document.getElementById('if-chk-preplanned');
+    var chkD = document.getElementById('if-chk-dug-in');
+    var pre = chkP && chkP.checked;
+    var dug = chkD && chkD.checked;
+    var firingRows = [];
+    var ri;
+    for (ri = 0; ri < indirectFireMission.firingRows.length; ri++) {
+      var row = indirectFireMission.firingRows[ri];
+      var rounds = getIndirectFireRoundsForRow(wrap, ri, row);
+      firingRows.push({
+        unit_key: unitKey(row.unit.side, row.unit),
+        weapon_name: row.weaponName,
+        tube_count: row.tubeCount,
+        if_score: row.ifScore,
+        rounds: rounds,
+      });
+    }
+    return {
+      target_key: unitKey(indirectFireMission.target.side, indirectFireMission.target),
+      firing_rows: firingRows,
+      preplanned: pre,
+      dug_in: dug,
+    };
   }
 
   function addIndirectFireRowsFromCandidateGroup(groupIndex) {
@@ -3004,10 +3130,102 @@
         ifScore: w.ifScore,
         ifRange: w.ifRange,
         distKm: w.distKm,
+        emplacementTimeMin: w.emplacementTimeMin,
+        emplaced: w.emplaced,
+        canFire: w.canFire,
+        exhausted: w.exhausted,
+        rounds: IF_DEFAULT_ROUNDS,
+        timeToFireMin: null,
+        timeToFireDetail: '',
       });
     }
     renderIndirectFireSelectedRows();
     refreshIndirectFireTotalScore();
+    refreshIndirectFireTimeToFire();
+  }
+
+  function refreshIndirectFireTimeToFire() {
+    var rows = indirectFireMission.firingRows;
+    if (!rows.length) return;
+    var wrap = document.getElementById('if-selected-rows');
+    var payload = [];
+    var ri;
+    for (ri = 0; ri < rows.length; ri++) {
+      var row = rows[ri];
+      var rounds = getIndirectFireRoundsForRow(wrap, ri, row);
+      payload.push({
+        unit_key: unitKey(row.unit.side, row.unit),
+        weapon_name: row.weaponName,
+        tube_count: row.tubeCount,
+        rounds: rounds,
+      });
+    }
+    GameApi.indirectFireTimeToFire(payload)
+      .then(function (data) {
+        var byKey = {};
+        (data.rows || []).forEach(function (r) {
+          byKey[r.unitKey + '|' + r.weaponName] = r;
+        });
+        for (ri = 0; ri < rows.length; ri++) {
+          var row2 = rows[ri];
+          var key = unitKey(row2.unit.side, row2.unit) + '|' + row2.weaponName;
+          var ttf = byKey[key];
+          if (!ttf) continue;
+          row2.timeToFireMin = ttf.timeToFireMin;
+          row2.canFire = ttf.canFire;
+          row2.emplaced = ttf.emplaced;
+          row2.exhausted = ttf.exhausted;
+          var parts = [];
+          if (ttf.emplacementWaitMin > 0) {
+            parts.push('emplacement ' + ttf.emplacementWaitMin.toFixed(1) + ' min');
+          }
+          if (ttf.fireDurationMin > 0) {
+            parts.push('firing ' + ttf.fireDurationMin.toFixed(1) + ' min');
+          }
+          if (ttf.exhausted) parts.push('exhausted (sustained rate only)');
+          row2.timeToFireDetail = parts.join(' · ');
+        }
+        updateIndirectFireTimeToFireDisplay();
+      })
+      .catch(function () {
+        updateIndirectFireTimeToFireDisplay();
+      });
+  }
+
+  function updateIndirectFireTimeToFireDisplay() {
+    var wrap = document.getElementById('if-selected-rows');
+    if (!wrap) return;
+    var rows = indirectFireMission.firingRows;
+    var ri;
+    for (ri = 0; ri < rows.length; ri++) {
+      var row = rows[ri];
+      var el = wrap.querySelector('.if-time-to-fire[data-row-index="' + ri + '"]');
+      if (!el) continue;
+      var ttfMin = row.timeToFireMin;
+      var label =
+        ttfMin != null && isFinite(ttfMin)
+          ? ttfMin.toFixed(1) + ' min'
+          : '—';
+      var warn = '';
+      if (!row.emplaced && row.emplacementTimeMin != null) {
+        warn = ' (not emplaced — need ' + row.emplacementTimeMin + ' min halted)';
+      } else if (row.canFire === false && row.emplacementTimeMin != null) {
+        warn = ' (not ready to fire)';
+      }
+      if (row.exhausted) warn += ' · exhausted';
+      if (row.timeToFireDetail) {
+        el.innerHTML =
+          '<strong>' +
+          escapeHtmlLite(label) +
+          '</strong>' +
+          (row.timeToFireDetail
+            ? ' <span class="if-ttf-detail">' + escapeHtmlLite(row.timeToFireDetail) + '</span>'
+            : '') +
+          (warn ? ' <span class="if-ttf-warn">' + escapeHtmlLite(warn) + '</span>' : '');
+      } else {
+        el.innerHTML = '<strong>' + escapeHtmlLite(label) + '</strong>' + escapeHtmlLite(warn);
+      }
+    }
   }
 
   function renderIndirectFireCandidateList() {
@@ -3019,7 +3237,8 @@
       var li0 = document.createElement('li');
       li0.className = 'if-candidate-empty';
       li0.style.cssText = 'font-size:13px;color:#64748b;padding:8px;';
-      li0.textContent = 'No enemy units with IF score > 0 and weapon IF range ≥ distance to target (km).';
+      li0.textContent =
+        'No artillery in range (IF-capable, within weapon range). Emplaced & halted required to fire.';
       ul.appendChild(li0);
       return;
     }
@@ -3029,7 +3248,9 @@
       var u = grp.unit;
       var wSummary = grp.weapons
         .map(function (w) {
-          return w.count + '\u00d7 ' + w.name;
+          var tag = w.emplaced ? '' : ' [not emplaced]';
+          if (w.exhausted) tag += ' [exhausted]';
+          return w.count + '\u00d7 ' + w.name + tag;
         })
         .join(', ');
       var li = document.createElement('li');
@@ -3043,7 +3264,13 @@
       t1.textContent = u.company + ' — ' + u.battalion;
       var t2 = document.createElement('span');
       t2.className = 'if-candidate-meta';
-      t2.textContent = wSummary;
+      t2.textContent =
+        wSummary +
+        (grp.timeInPositionMin != null && u.activity === 'halted'
+          ? ' · ' + grp.timeInPositionMin.toFixed(1) + ' min in position'
+          : u.activity === 'moving'
+            ? ' · moving'
+            : '');
       btn.appendChild(t1);
       btn.appendChild(t2);
       li.appendChild(btn);
@@ -3065,11 +3292,8 @@
     for (ri = 0; ri < rows.length; ri++) {
       var row = rows[ri];
       var u = row.unit;
-      var opts = '';
-      var r;
-      for (r = 1; r <= 20; r++) {
-        opts += '<option value="' + r + '"' + (r === 1 ? ' selected' : '') + '>' + r + '</option>';
-      }
+      var roundsVal =
+        row.rounds != null ? parseIndirectFireRounds(row.rounds) : IF_DEFAULT_ROUNDS;
       h +=
         '<div class="if-firing-row" data-row-index="' +
         ri +
@@ -3090,13 +3314,25 @@
         '<span class="if-firing-row-label">Tubes</span><span>' +
         String(row.tubeCount) +
         '</span>' +
-        '</div>' +
-        '<label class="if-rounds-select">Rounds ' +
-        '<select class="if-rounds-select-input" data-row-index="' +
+        '<span class="if-firing-row-label">Time to fire</span>' +
+        '<span class="if-time-to-fire" data-row-index="' +
         ri +
-        '">' +
-        opts +
-        '</select></label>' +
+        '">—</span>' +
+        '</div>' +
+        '<div class="if-rounds-stepper">' +
+        '<span class="if-rounds-stepper-label">Rounds</span>' +
+        '<button type="button" class="if-rounds-step-btn if-rounds-dec" data-row-index="' +
+        ri +
+        '" title="Fewer rounds" aria-label="Decrease rounds">−</button>' +
+        '<input type="text" inputmode="numeric" class="if-rounds-input" data-row-index="' +
+        ri +
+        '" value="' +
+        String(roundsVal) +
+        '" aria-label="Rounds per tube" />' +
+        '<button type="button" class="if-rounds-step-btn if-rounds-inc" data-row-index="' +
+        ri +
+        '" title="More rounds" aria-label="Increase rounds">+</button>' +
+        '</div>' +
         '</div>';
     }
     wrap.innerHTML = h;
@@ -3114,9 +3350,7 @@
     var ri;
     for (ri = 0; ri < indirectFireMission.firingRows.length; ri++) {
       var row = indirectFireMission.firingRows[ri];
-      var sel = wrap ? wrap.querySelector('select.if-rounds-select-input[data-row-index="' + ri + '"]') : null;
-      var rounds = sel ? parseInt(sel.value, 10) : 1;
-      if (!isFinite(rounds) || rounds < 1) rounds = 1;
+      var rounds = getIndirectFireRoundsForRow(wrap, ri, row);
       base += row.tubeCount * row.ifScore * rounds;
     }
     var mul = (pre ? 2 : 1) * (dug ? 0.5 : 1);
@@ -3159,13 +3393,19 @@
                 ifRange: w.ifRange,
                 ifScore: w.ifScore,
                 distKm: w.distKm,
+                emplacementTimeMin: w.emplacementTimeMin,
+                emplaced: w.emplaced,
+                canFire: w.canFire,
+                exhausted: w.exhausted,
               };
             }),
+            timeInPositionMin: g.timeInPositionMin,
           };
         });
         renderIndirectFireCandidateList();
         renderIndirectFireSelectedRows();
         refreshIndirectFireTotalScore();
+        refreshIndirectFireTimeToFire();
         if (modal) modal.hidden = false;
       })
       .catch(function (err) {
@@ -3182,34 +3422,25 @@
       setStatus('Indirect fire: add at least one firing unit.');
       return;
     }
-    var wrap = document.getElementById('if-selected-rows');
-    var chkP = document.getElementById('if-chk-preplanned');
-    var chkD = document.getElementById('if-chk-dug-in');
-    var pre = chkP && chkP.checked;
-    var dug = chkD && chkD.checked;
-    var firingRows = [];
-    var ri;
-    for (ri = 0; ri < indirectFireMission.firingRows.length; ri++) {
-      var row = indirectFireMission.firingRows[ri];
-      var selR = wrap ? wrap.querySelector('select.if-rounds-select-input[data-row-index="' + ri + '"]') : null;
-      var rounds = selR ? parseInt(selR.value, 10) : 1;
-      firingRows.push({
-        unit_key: unitKey(row.unit.side, row.unit),
-        weapon_name: row.weaponName,
-        tube_count: row.tubeCount,
-        if_score: row.ifScore,
-        rounds: rounds,
-      });
-    }
-    GameApi.indirectFireResolve({
-      target_key: unitKey(indirectFireMission.target.side, indirectFireMission.target),
-      firing_rows: firingRows,
-      preplanned: pre,
-      dug_in: dug,
-    })
+    var payload = buildIfMissionPayload();
+    var apiCall =
+      activeIfMission && activeIfMission.active
+        ? GameApi.ifMissionPlan(payload)
+        : GameApi.indirectFireResolve(payload);
+    apiCall
       .then(function (res) {
-        setStatus(res.message || 'Indirect fire executed.');
-        closeIndirectFireModal();
+        applyServerUnits(res.units);
+        activeIfMission = res.activeIfMission || null;
+        indirectFireMission.active = !!(activeIfMission && activeIfMission.active);
+        var uu;
+        for (uu = 0; uu < units.length; uu++) {
+          refreshUnitMarkerIcon(units[uu]);
+        }
+        updateIfMissionStatusLine();
+        setStatus(res.message || 'Indirect fire mission updated.');
+        if (!indirectFireMission.active) {
+          closeIndirectFireModal();
+        }
       })
       .catch(function (err) {
         setStatus('Indirect fire failed: ' + err.message);
@@ -3239,6 +3470,40 @@
     }
     if (chkP) chkP.addEventListener('change', refreshIndirectFireTotalScore);
     if (chkD) chkD.addEventListener('change', refreshIndirectFireTotalScore);
+    if (selectedWrap) {
+      selectedWrap.addEventListener('input', function (ev) {
+        if (ev.target && ev.target.classList && ev.target.classList.contains('if-rounds-input')) {
+          refreshIndirectFireTotalScore();
+          refreshIndirectFireTimeToFire();
+        }
+      });
+      selectedWrap.addEventListener('change', function (ev) {
+        if (ev.target && ev.target.classList && ev.target.classList.contains('if-rounds-input')) {
+          var inp = ev.target;
+          inp.value = String(parseIndirectFireRounds(inp.value));
+          refreshIndirectFireTotalScore();
+          refreshIndirectFireTimeToFire();
+        }
+      });
+      selectedWrap.addEventListener('click', function (ev) {
+        var dec = ev.target && ev.target.closest ? ev.target.closest('.if-rounds-dec') : null;
+        var inc = ev.target && ev.target.closest ? ev.target.closest('.if-rounds-inc') : null;
+        var btn = dec || inc;
+        if (!btn) return;
+        ev.preventDefault();
+        var idx = parseInt(btn.getAttribute('data-row-index'), 10);
+        if (isNaN(idx)) return;
+        var inp2 = getIndirectFireRoundsInput(selectedWrap, idx);
+        if (!inp2) return;
+        var cur = parseIndirectFireRounds(inp2.value);
+        inp2.value = String(dec ? Math.max(1, cur - 1) : cur + 1);
+        if (indirectFireMission.firingRows[idx]) {
+          indirectFireMission.firingRows[idx].rounds = parseIndirectFireRounds(inp2.value);
+        }
+        refreshIndirectFireTotalScore();
+        refreshIndirectFireTimeToFire();
+      });
+    }
     if (list) {
       list.addEventListener('click', function (ev) {
         var btn = ev.target && ev.target.closest ? ev.target.closest('.if-candidate-btn') : null;
@@ -3246,13 +3511,6 @@
         var idx = parseInt(btn.getAttribute('data-candidate-group-index'), 10);
         if (isNaN(idx)) return;
         addIndirectFireRowsFromCandidateGroup(idx);
-      });
-    }
-    if (selectedWrap) {
-      selectedWrap.addEventListener('change', function (ev) {
-        if (ev.target && ev.target.classList && ev.target.classList.contains('if-rounds-select-input')) {
-          refreshIndirectFireTotalScore();
-        }
       });
     }
   }
@@ -3272,7 +3530,11 @@
       ['Vehicle', u.vehicle],
       ['Activity', u.activity],
       ['Position hex', data.positionHexKey || '—'],
-      ['Time in position', data.timeInPosition || '—'],
+      [
+        'Time in position',
+        (data.unit && data.unit.activity === 'moving') ? '0 min (moving)' : data.timeInPosition || '—',
+      ],
+      ['IF exhausted', data.ifExhausted ? 'Yes' : 'No'],
       ['Lat / Lon', u.lat != null ? u.lat.toFixed(5) + ', ' + u.lon.toFixed(5) : '—'],
       ['Spotted', u.spotted ? 'Yes' : 'No'],
       ['Direct fire', u.totalDirectFire],
@@ -3320,6 +3582,21 @@
           '</td><td>' +
           esc(st.ccScore != null ? String(st.ccScore) : '—') +
           '</td></tr>';
+        if (eq.artillery) {
+          var ar = eq.artillery;
+          html +=
+            '<tr class="unit-info-artillery-detail"><td colspan="8">Emplacement ' +
+            esc(String(ar.emplacementTimeMin)) +
+            ' min · Displace ' +
+            esc(String(ar.displacementTimeMin)) +
+            ' min · Max ' +
+            esc(String(ar.maxRateOfFirePerTube != null ? ar.maxRateOfFirePerTube : ar.maxRateOfFire)) +
+            ' rds/tube/min · Sustained ' +
+            esc(String(ar.sustainedRateOfFirePerTube != null ? ar.sustainedRateOfFirePerTube : ar.sustainedRateOfFire)) +
+            ' rds/tube/min · Battery max ' +
+            esc(String((ar.maxRateOfFirePerTube || ar.maxRateOfFire || 0) * (eq.count || 1))) +
+            ' rds/min</td></tr>';
+        }
       }
       html += '</tbody></table>';
     }

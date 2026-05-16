@@ -1,0 +1,5 @@
+name,movement,direct_fire_range,direct_fire_score,indirect_fire_range,indirect_fire_score,close_combat_score,is_hard_target
+T-72,6,3,1,0,0,1,true
+M60,6,3,1,0,0,1,true
+M113,6,0,0,0,0,1,false
+BMP-1,6,3,0.67,0,0,1,false
