@@ -1,0 +1,6 @@
+name,movement,direct_fire_range,direct_fire_score,indirect_fire_range,indirect_fire_score,close_combat_score
+T-72,6,3,1,0,0,1
+M60,6,3,1,0,0,1
+M113,6,0,0,0,0,1
+2S1,6,4,0.5,15,0.67,0.3
+BMP-1,6,3,0.67,0,0,1

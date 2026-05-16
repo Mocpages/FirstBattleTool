@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Wargame Umpire Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header id="timebar" aria-label="Exercise time">
+    <div class="timebar-inner">
+      <div class="timebar-text">
+        <div id="timebar-main" class="timebar-large">0800 19SEP89</div>
+        <div id="timebar-daynight" class="timebar-sub">Night</div>
+        <div id="timebar-sun" class="timebar-detail">Sunrise 06:42 · Sunset 19:08 · Sunrise in 05:20</div>
+      </div>
+      <button type="button" id="timebar-play" class="timebar-play">Play</button>
+    </div>
+  </header>
+  <nav id="order-menus" class="order-menus" hidden aria-label="Unit orders">
+    <ul class="order-menus-bar">
+      <li class="order-bar-item order-bar-item--has-submenu">
+        <span class="order-bar-label" tabindex="0">Friendly orders</span>
+        <ul class="order-dropdown order-dropdown--1" role="menu">
+          <li class="order-sub-item order-sub-item--has-submenu">
+            <span class="order-sub-label">Move</span>
+            <ul class="order-dropdown order-dropdown--2" role="menu">
+              <li><button type="button" class="order-leaf" data-action="friendly-move-traveling">Traveling</button></li>
+              <li><button type="button" class="order-leaf" data-action="friendly-move-traveling-overwatch">Traveling overwatch</button></li>
+              <li><button type="button" class="order-leaf" data-action="friendly-move-bounding-overwatch">Bounding overwatch</button></li>
+            </ul>
+          </li>
+        </ul>
+      </li>
+      <li class="order-bar-item order-bar-item--has-submenu">
+        <span class="order-bar-label" tabindex="0">Enemy orders</span>
+        <ul class="order-dropdown order-dropdown--1" role="menu">
+          <li><button type="button" class="order-leaf" data-action="enemy-indirect-fire">Indirect fire</button></li>
+          <li><button type="button" class="order-leaf" data-action="enemy-direct-fire">Direct fire</button></li>
+          <li><button type="button" class="order-leaf" data-action="enemy-assault">Assault</button></li>
+        </ul>
+      </li>
+      <li class="order-bar-item order-bar-item--has-submenu">
+        <span class="order-bar-label" tabindex="0">Umpire</span>
+        <ul class="order-dropdown order-dropdown--1" role="menu">
+          <li><button type="button" class="order-leaf order-leaf--single" data-action="umpire-magic-move">Magic move</button></li>
+        </ul>
+      </li>
+    </ul>
+  </nav>
+  <div id="map"></div>
+  <button type="button" id="terrain-overlay-toggle" class="terrain-overlay-toggle" aria-pressed="false" title="Toggle hex overlay (rounded MP from mv_cost.tif)">Terrain</button>
+  <div id="legend">
+    <strong>Selection</strong>
+    <p id="selection-status">No selection</p>
+  </div>
+  <div id="acquisition-modal" class="game-modal game-modal--map-passthrough" role="dialog" aria-modal="true" aria-labelledby="acquisition-modal-title" hidden>
+    <div class="game-modal-backdrop"></div>
+    <div class="game-modal-panel game-modal-panel--acquisition">
+      <h2 id="acquisition-modal-title" class="game-modal-title game-modal-drag-handle">Potential Acquisition Event</h2>
+      <div id="acquisition-modal-body" class="game-modal-body"></div>
+      <div class="game-modal-actions">
+        <button type="button" id="acquisition-deny" class="game-modal-btn game-modal-btn--secondary">Deny</button>
+        <button type="button" id="acquisition-confirm" class="game-modal-btn game-modal-btn--primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+  <div id="spotreport-modal" class="game-modal" role="dialog" aria-modal="true" aria-labelledby="spotreport-modal-title" hidden>
+    <div class="game-modal-backdrop"></div>
+    <div class="game-modal-panel">
+      <h2 id="spotreport-modal-title" class="game-modal-title">Spot Report</h2>
+      <div id="spotreport-modal-body" class="game-modal-body"></div>
+      <div class="game-modal-actions">
+        <button type="button" id="spotreport-ok" class="game-modal-btn game-modal-btn--primary">OK</button>
+      </div>
+    </div>
+  </div>
+  <div id="indirect-fire-modal" class="if-modal" role="dialog" aria-modal="true" aria-labelledby="if-modal-title" hidden>
+    <div class="if-modal-backdrop"></div>
+    <div class="if-modal-panel">
+      <div class="if-modal-header">
+        <h2 id="if-modal-title" class="if-modal-title">Indirect fire</h2>
+        <button type="button" id="if-modal-close" class="if-modal-x" title="Close" aria-label="Close and cancel">×</button>
+      </div>
+      <div class="if-modal-body">
+        <p id="if-modal-target-line" class="if-modal-target-line"></p>
+        <div class="if-modal-columns">
+          <aside class="if-modal-candidates">
+            <div class="if-modal-section-title">Enemy units (IF-capable, in range)</div>
+            <ul id="if-candidate-list" class="if-candidate-list"></ul>
+          </aside>
+          <section class="if-modal-selected">
+            <div class="if-modal-section-title">Selected firing units</div>
+            <div id="if-selected-rows" class="if-selected-rows"></div>
+          </section>
+        </div>
+      </div>
+      <div class="if-modal-footer">
+        <div class="if-modal-footer-main">
+          <div class="if-total-line">
+            Total indirect fire score (modifiers applied):
+            <strong id="if-total-score">0</strong>
+          </div>
+          <label class="if-check"><input type="checkbox" id="if-chk-preplanned" /> Preplanned Fires (double IFS)</label>
+          <label class="if-check"><input type="checkbox" id="if-chk-dug-in" /> Target dug in or in complex terrain (halves losses)</label>
+        </div>
+        <div class="if-modal-footer-actions">
+          <button type="button" id="if-btn-fire" class="if-btn-fire">FIRE</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script src="https://unpkg.com/milsymbol@3.0.4/dist/milsymbol.js" crossorigin=""></script>
+  <script src="https://cdn.jsdelivr.net/npm/suncalc@1.9.0/suncalc.js" crossorigin=""></script>
+  <script src="https://cdn.jsdelivr.net/npm/mgrs@2.1.0/dist/mgrs.min.js" crossorigin=""></script>
+  <script src="api-client.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
