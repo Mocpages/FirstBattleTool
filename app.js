@@ -9,6 +9,7 @@
   var BATTALION_SYMBOL_SIZE = 52;
   /** Company marker: combat totals column (px), equipment column (px). */
   var COMBAT_SIDEBAR_W = 44;
+  var UNIT_DESIGNATION_MIN_W = 52;
   var EQUIP_SIDEBAR_W = 68;
   /** Hex mesh only at this zoom level and closer (zoomed further in). */
   var HEX_GRID_MIN_ZOOM = 11;
@@ -136,6 +137,8 @@
     u.positionSinceSimMs = su.positionSinceSimMs;
     u.ifExhausted = su.ifExhausted;
     u.ifCeaseFireSimMs = su.ifCeaseFireSimMs;
+    if (su.unitType != null) u.unitType = su.unitType;
+    if (su.unitSize != null) u.unitSize = su.unitSize;
     return u;
   }
 
@@ -1728,7 +1731,9 @@
       !!(u.destinationKey || (u.routeWaypointKeys && u.routeWaypointKeys.length > 0));
     var leftH2 = buildCombatSidebarHtml(u.totalDirectFire, u.totalIndirectFire, u.totalCloseCombat);
     var rightH2 = buildEquipmentSidebarHtml(u.equipmentSpecs || []);
-    mk.setIcon(makeMarkerIcon(u.side, SYMBOL_SIZE, u.activity, showClr, u.spotted, leftH2, rightH2));
+    mk.setIcon(
+      makeMarkerIcon(u.side, SYMBOL_SIZE, u.activity, showClr, u.spotted, leftH2, rightH2, unitMarkerOpts(u)),
+    );
     bindUnitRouteClearButton(mk, u);
   }
 
@@ -2214,9 +2219,7 @@
       var cen = centroidLatLon(grp.units);
       var m = battalionMarkerByKey[bk];
       m.setLatLng(cen);
-      m.setIcon(
-        makeMarkerIcon(grp.side, BATTALION_SYMBOL_SIZE, summarizeBattalionActivity(grp.units)),
-      );
+      m.setIcon(makeBattalionMarkerIcon(grp));
     }
   }
 
@@ -2290,8 +2293,7 @@
       if (grp.units.length < 2) continue;
       var cen = centroidLatLon(grp.units);
       var rep = grp.units[0];
-      var actLbl = summarizeBattalionActivity(grp.units);
-      var marker = L.marker(cen, { icon: makeMarkerIcon(grp.side, BATTALION_SYMBOL_SIZE, actLbl) });
+      var marker = L.marker(cen, { icon: makeBattalionMarkerIcon(grp) });
       marker.bindTooltip(grp.battalion + ' (battalion, ' + grp.units.length + ' companies)', {
         direction: 'top',
         offset: [0, -22],
@@ -2383,7 +2385,7 @@
 
   function buildCombatSidebarHtml(df, inf, cc) {
     return (
-      '<div class="unit-combat-left">' +
+      '<div class="unit-combat-left marker-text-outline">' +
       '<div><span class="unit-combat-abbr">DF</span> ' +
       escapeHtmlLite(formatCombatScoreNumber(df)) +
       '</div>' +
@@ -2399,7 +2401,7 @@
 
   function buildEquipmentSidebarHtml(specs) {
     if (!specs.length) {
-      return '<div class="unit-equip-right"></div>';
+      return '<div class="unit-equip-right marker-text-outline"></div>';
     }
     var lines = [];
     var li;
@@ -2408,7 +2410,7 @@
         escapeHtmlLite(String(specs[li].count) + '\u00d7 ' + specs[li].name),
       );
     }
-    return '<div class="unit-equip-right">' + lines.join('<br>') + '</div>';
+    return '<div class="unit-equip-right marker-text-outline">' + lines.join('<br>') + '</div>';
   }
 
   function parseCSV(text) {
@@ -2424,6 +2426,8 @@
     var loni = header.indexOf('lon') >= 0 ? header.indexOf('lon') : header.indexOf('lng');
     var vi = header.indexOf('vehicle');
     var ei = header.indexOf('equipment');
+    var uti = header.indexOf('unittype');
+    var usi = header.indexOf('unitsize');
     if (ci < 0 || bi < 0 || lati < 0 || loni < 0) {
       throw new Error('CSV must include columns: company, battalion, lat, lon (or lng)');
     }
@@ -2438,6 +2442,8 @@
       if (ei >= 0 && parts.length > ei) {
         equipStr = parts.slice(ei).join(',').trim();
       }
+      var unitType = uti >= 0 && parts[uti] ? parts[uti].trim().toLowerCase() : 'infantry';
+      var unitSize = usi >= 0 && parts[usi] ? parts[usi].trim().toLowerCase() : 'company';
       rows.push({
         company: parts[ci] ? parts[ci].trim() : '',
         battalion: parts[bi] ? parts[bi].trim() : '',
@@ -2445,6 +2451,8 @@
         lon: parseFloat(parts[loni]),
         vehicle: vv,
         equipment: equipStr,
+        unitType: unitType,
+        unitSize: unitSize,
       });
     }
     return rows;
@@ -2470,8 +2478,101 @@
   }
 
   var ACTIVITY_LABEL_ROW_PX = 15;
+  var NAME_LABEL_ROW_PX = 14;
 
-  function wrapMarkerHtml(innerSymbolHtml, activityText, showRouteClear, spotted, combatLeftHtml, equipRightHtml) {
+  /** APP-6 function id (positions 5–10) by unitType. */
+  var UNIT_TYPE_FUNCTION = {
+    infantry: 'UCI---',
+    mech: 'UCIZ--',
+    armor: 'UCA---',
+    artillery: 'UCF---',
+    'self propelled arty': 'UCFHE-',
+    mlrs: 'UCFRM-',
+    missile: 'UCMS--',
+    command: 'UCH---',
+    logistics: 'USS---',
+    recon: "UCRVG-"
+  };
+
+  /** Echelon character (position 11) by unitSize. */
+  var UNIT_SIZE_ECHELON = {
+    team: 'A',
+    squad: 'B',
+    section: 'C',
+    platoon: 'D',
+    company: 'E',
+    battalion: 'F',
+    regiment: 'G',
+    brigade: 'H',
+    division: 'I',
+  };
+
+  function normalizeUnitType(t) {
+    var s = (t || 'infantry').toString().trim().toLowerCase();
+    return UNIT_TYPE_FUNCTION[s] ? s : 'infantry';
+  }
+
+  function normalizeUnitSize(s) {
+    var z = (s || 'company').toString().trim().toLowerCase();
+    return UNIT_SIZE_ECHELON[z] ? z : 'company';
+  }
+
+  function buildUnitSidc(side, unitType, unitSize) {
+    var isBlue = side === 'blue';
+    var aff = isBlue ? 'F' : 'H';
+    var fn = UNIT_TYPE_FUNCTION[normalizeUnitType(unitType)] || UNIT_TYPE_FUNCTION.infantry;
+    var ech = UNIT_SIZE_ECHELON[normalizeUnitSize(unitSize)] || 'E';
+    return 'S' + aff + 'GP' + fn + "*" + "ech" + '**';
+  }
+
+  /** e.g. "B CO/2-32AR" */
+  function formatCompanyBattalionLabel(company, battalion) {
+    var co = (company || '').trim();
+    var bn = (battalion || '').trim();
+    if (!co && !bn) return '';
+    if (!bn) return co;
+    if (!co) return bn;
+    var ord = co.match(/^(\d+)(?:st|nd|rd|th)?\s+Company$/i);
+    if (ord) co = ord[1] + ' CO';
+    var named = co.match(/^([A-Za-z]+)\s+Company$/i);
+    if (named) co = named[1].charAt(0).toUpperCase() + ' CO';
+    return co + '/' + bn;
+  }
+
+  function designationLabelWidth(text) {
+    if (!text) return 0;
+    return Math.min(110, Math.max(UNIT_DESIGNATION_MIN_W, Math.ceil(text.length * 5.2) + 6));
+  }
+
+  function inferBattalionUnitType(unitList) {
+    var counts = {};
+    var i;
+    for (i = 0; i < unitList.length; i++) {
+      var t = normalizeUnitType(unitList[i].unitType);
+      counts[t] = (counts[t] || 0) + 1;
+    }
+    var best = 'infantry';
+    var bestN = 0;
+    for (var k in counts) {
+      if (counts[k] > bestN) {
+        bestN = counts[k];
+        best = k;
+      }
+    }
+    return best;
+  }
+
+  function wrapMarkerHtml(
+    innerSymbolHtml,
+    activityText,
+    showRouteClear,
+    spotted,
+    combatLeftHtml,
+    equipRightHtml,
+    captionMode,
+    unitDesignation,
+  ) {
+    captionMode = captionMode || 'activity';
     var sc = !!showRouteClear;
     var sp = !!spotted;
     var btn = sc
@@ -2481,14 +2582,22 @@
       ? '<span class="unit-spotted-eye" title="Spotted" aria-label="Spotted">' + SPOTTED_EYE_SVG + '</span>'
       : '';
     var hasSides = !!(combatLeftHtml || equipRightHtml);
+    var desigHtml = unitDesignation
+      ? '<div class="unit-designation-label marker-text-outline">' +
+        escapeHtmlLite(unitDesignation) +
+        '</div>'
+      : '';
     var centerBlock =
       '<div class="marker-center-col">' +
+      '<div class="marker-symbol-row">' +
       '<div class="marker-symbol-slot">' +
       eye +
       innerSymbolHtml +
       '</div>' +
-      '<div class="unit-activity-label">' +
-      activityText +
+      desigHtml +
+      '</div>' +
+      '<div class="unit-activity-label marker-text-outline">' +
+      escapeHtmlLite(activityText || '') +
       '</div>' +
       '</div>';
     var bodyHtml;
@@ -2513,18 +2622,34 @@
     );
   }
 
-  /** APP-6 15-char SIDC: friendly/hostile infantry, plus activity caption under symbol */
-  function makeMarkerIcon(side, symbolPixelSize, activityText, showRouteClear, spotted, combatLeftHtml, equipRightHtml) {
+  /**
+   * NATO marker; unitOpts: { unitType, unitSize, captionMode: 'activity'|'name' }.
+   */
+  function makeMarkerIcon(
+    side,
+    symbolPixelSize,
+    activityText,
+    showRouteClear,
+    spotted,
+    combatLeftHtml,
+    equipRightHtml,
+    unitOpts,
+  ) {
+    unitOpts = unitOpts || {};
     var showClr = !!showRouteClear;
     var sp = !!spotted;
     var caption = activityText || 'halted';
+    var captionMode = unitOpts.captionMode || 'activity';
+    var unitLabel = unitOpts.unitLabel || '';
     var szPx = typeof symbolPixelSize === 'number' && !isNaN(symbolPixelSize) ? symbolPixelSize : SYMBOL_SIZE;
     var msApi = getMilsymbolApi();
     var isBlue = side === 'blue';
-    var sidc = isBlue ? 'SFGPUCI---**F***' : 'SHGPUCI---**H***';
+    var sidc = buildUnitSidc(side, unitOpts.unitType, unitOpts.unitSize);
     var hasSides = !!(combatLeftHtml || equipRightHtml);
+    var labelRowPx = ACTIVITY_LABEL_ROW_PX;
     var cw = hasSides ? COMBAT_SIDEBAR_W : 0;
     var ew = hasSides ? EQUIP_SIDEBAR_W : 0;
+    var dw = designationLabelWidth(unitLabel);
     if (msApi && msApi.Symbol) {
       try {
         var sym = new msApi.Symbol(sidc, {
@@ -2536,9 +2661,19 @@
         var svg = sym.asSVG();
         var sz = sym.getSize ? sym.getSize() : { width: szPx, height: szPx };
         var ac = sym.getAnchor ? sym.getAnchor() : { x: szPx / 2, y: szPx / 2 };
-        var html = wrapMarkerHtml(svg, caption, showClr, sp, combatLeftHtml, equipRightHtml);
-        var totalW = cw + sz.width + ew;
-        var totalH = sz.height + ACTIVITY_LABEL_ROW_PX;
+        var html = wrapMarkerHtml(
+          svg,
+          caption,
+          showClr,
+          sp,
+          combatLeftHtml,
+          equipRightHtml,
+          captionMode,
+          unitLabel,
+        );
+        var centerW = sz.width + dw;
+        var totalW = cw + centerW + ew;
+        var totalH = Math.max(sz.height, labelRowPx + 4) + labelRowPx;
         var ax = cw + ac.x;
         return L.divIcon({
           className: 'nato-symbol-marker marker-with-activity unit-marker unit-marker-' + side,
@@ -2563,17 +2698,54 @@
       ';border:2px solid ' +
       border +
       ';margin:0 auto;"></div>';
-    var html2 = wrapMarkerHtml(dot, caption, showClr, sp, combatLeftHtml, equipRightHtml);
+    var html2 = wrapMarkerHtml(
+      dot,
+      caption,
+      showClr,
+      sp,
+      combatLeftHtml,
+      equipRightHtml,
+      captionMode,
+      unitLabel,
+    );
     var symW = d + 4;
     var ax = cw + Math.round(symW / 2);
-    var totalW2 = cw + symW + ew;
-    var totalH2 = symW + ACTIVITY_LABEL_ROW_PX;
+    var totalW2 = cw + symW + dw + ew;
+    var totalH2 = symW + labelRowPx;
     return L.divIcon({
       className: 'nato-symbol-marker marker-with-activity unit-marker unit-marker-' + side,
       html: html2,
       iconSize: [totalW2, totalH2],
       iconAnchor: [ax, ax],
     });
+  }
+
+  function makeBattalionMarkerIcon(grp) {
+    var unitType = inferBattalionUnitType(grp.units);
+    return makeMarkerIcon(
+      grp.side,
+      BATTALION_SYMBOL_SIZE,
+      summarizeBattalionActivity(grp.units),
+      false,
+      false,
+      null,
+      null,
+      {
+        unitType: unitType,
+        unitSize: 'battalion',
+        captionMode: 'activity',
+        unitLabel: (grp.battalion || '').trim(),
+      },
+    );
+  }
+
+  function unitMarkerOpts(u) {
+    return {
+      unitType: normalizeUnitType(u.unitType),
+      unitSize: normalizeUnitSize(u.unitSize),
+      captionMode: 'activity',
+      unitLabel: formatCompanyBattalionLabel(u.company, u.battalion),
+    };
   }
 
   function getMergedZOCKeys() {
@@ -2926,12 +3098,23 @@
 
   function mountUnitsFromServer(serverUnits) {
     serverUnits.forEach(function (u) {
+      u.unitType = normalizeUnitType(u.unitType);
+      u.unitSize = normalizeUnitSize(u.unitSize);
       units.push(u);
       var specs = u.equipmentSpecs || [];
       var leftH = buildCombatSidebarHtml(u.totalDirectFire, u.totalIndirectFire, u.totalCloseCombat);
       var rightH = buildEquipmentSidebarHtml(specs);
       var marker = L.marker([u.lat, u.lon], {
-        icon: makeMarkerIcon(u.side, SYMBOL_SIZE, u.activity, false, false, leftH, rightH),
+        icon: makeMarkerIcon(
+          u.side,
+          SYMBOL_SIZE,
+          u.activity,
+          false,
+          false,
+          leftH,
+          rightH,
+          unitMarkerOpts(u),
+        ),
       });
       wireMarker(marker, u);
       marker.bindTooltip(u.company + ' — ' + u.battalion, { direction: 'top', offset: [0, -18] });

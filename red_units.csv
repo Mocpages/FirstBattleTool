@@ -1,6 +1,6 @@
-company,battalion,lat,lon,vehicle,equipment
-1st Company,113th Motor Rifle Regiment,50.4820,9.7580,truck,12 BMP-1;4 T-72
-2nd Company,113th Motor Rifle Regiment,50.4950,9.7820,tracked,12 BMP-1;4 T-72
-3rd Company,113th Motor Rifle Regiment,50.4660,9.7750,tracked,8 2S1
-1st Company,31st Tank Regiment,50.5620,9.6980,tracked,8 2S1
-2nd Company,31st Tank Regiment,50.5790,9.7250,tracked,12 BMP-1;4 T-72
+company,battalion,lat,lon,vehicle,equipment,unitType,unitSize
+1st Company,113th Motor Rifle Regiment,50.4820,9.7580,truck,12 BMP-1;4 T-72,mech,company
+2nd Company,113th Motor Rifle Regiment,50.4950,9.7820,tracked,12 BMP-1;4 T-72,mech,company
+3rd Company,113th Motor Rifle Regiment,50.4660,9.7750,tracked,8 2S1,artillery,company
+1st Company,31st Tank Regiment,50.5620,9.6980,tracked,8 2S1,self propelled arty,company
+2nd Company,31st Tank Regiment,50.5790,9.7250,tracked,12 BMP-1;4 T-72,armor,company

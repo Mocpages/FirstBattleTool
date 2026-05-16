@@ -95,7 +95,7 @@ class MovementCostRaster:
         n_key = self.grid.neighbor_key(from_key, direction)
         if not self.hex_has_raster(from_key) or not self.hex_has_raster(n_key):
             return None
-        return self.mv_at_hex_key(n_key)
+        return self.mv_at_hex_key(n_key) / 14
 
     def segment_move_cost(self, from_key: str, to_key: str) -> float | None:
         di = self.grid.direction_index(from_key, to_key)

@@ -74,6 +74,8 @@ class GameState:
             "lon": raw["lon"],
             "side": side,
             "vehicle": raw["vehicle"],
+            "unitType": raw.get("unitType", "infantry"),
+            "unitSize": raw.get("unitSize", "company"),
             "activity": "halted",
             "destinationKey": None,
             "routeWaypointKeys": [],
