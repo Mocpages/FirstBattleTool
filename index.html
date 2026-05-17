@@ -67,9 +67,73 @@
       <div class="game-modal-actions">
         <button type="button" id="acquisition-deny" class="game-modal-btn game-modal-btn--secondary">Deny</button>
         <button type="button" id="acquisition-confirm" class="game-modal-btn game-modal-btn--primary">Confirm</button>
+        <button type="button" id="acquisition-engage-df" class="game-modal-btn game-modal-btn--primary" hidden>Engage direct fire</button>
       </div>
     </div>
   </div>
+  <div id="df-opportunity-modal" class="game-modal game-modal--map-passthrough" role="dialog" aria-modal="true" aria-labelledby="df-opportunity-modal-title" hidden>
+    <div class="game-modal-backdrop"></div>
+    <div class="game-modal-panel game-modal-panel--acquisition">
+      <h2 id="df-opportunity-modal-title" class="game-modal-title game-modal-drag-handle">Direct fire engagement opportunity</h2>
+      <div id="df-opportunity-modal-body" class="game-modal-body"></div>
+      <div class="game-modal-actions">
+        <button type="button" id="df-opportunity-deny" class="game-modal-btn game-modal-btn--secondary">Deny</button>
+        <button type="button" id="df-opportunity-confirm" class="game-modal-btn game-modal-btn--primary">Confirm</button>
+      </div>
+    </div>
+  </div>
+  <div id="direct-fire-modal" class="if-modal" role="dialog" aria-modal="true" aria-labelledby="df-modal-title" hidden>
+    <div class="if-modal-backdrop"></div>
+    <div class="if-modal-panel">
+      <div class="if-modal-header">
+        <h2 id="df-modal-title" class="if-modal-title">Direct fire</h2>
+        <button type="button" id="df-modal-close" class="if-modal-x" title="Close" aria-label="Close">×</button>
+      </div>
+      <div class="if-modal-body">
+        <p id="df-modal-engagement-line" class="if-modal-target-line"></p>
+        <p id="df-mission-status" class="if-mission-status" hidden></p>
+        <div class="if-modal-columns">
+          <aside class="if-modal-candidates">
+            <div class="if-modal-section-title">Enemy shooters in range</div>
+            <ul id="df-candidate-list" class="if-candidate-list"></ul>
+          </aside>
+          <section class="if-modal-selected">
+            <div class="if-modal-section-title">Engagement settings</div>
+            <p class="df-hint">Click units in the list to add or remove shooters.</p>
+            <ul id="df-selected-shooters" class="df-selected-shooters"></ul>
+            <div class="df-mod-group">
+              <div class="if-modal-section-title">Target modifiers (victim)</div>
+              <label class="if-check"><input type="checkbox" id="df-chk-target-dug-in" /> Target dug in (0.5x losses)</label>
+              <label class="if-check"><input type="checkbox" id="df-chk-target-obstacles" /> Target halted by obstacles (2x losses)</label>
+              <label class="if-check"><input type="checkbox" id="df-chk-target-flank" /> Flank shot (2x losses)</label>
+            </div>
+            <div class="df-mod-group">
+              <div class="if-modal-section-title">Victim response</div>
+              <label class="if-check"><input type="radio" name="df-victim-response" value="continue_moving" checked /> Continue moving (return fire at 1/3 rate)</label>
+              <label class="if-check"><input type="radio" name="df-victim-response" value="return_fire" /> Stop and return fire</label>
+            </div>
+            <div id="df-return-mods" class="df-mod-group" hidden>
+              <div class="if-modal-section-title">Return fire modifiers (shooter as target)</div>
+              <label class="if-check"><input type="checkbox" id="df-chk-return-dug-in" /> Target dug in (0.5x losses)</label>
+              <label class="if-check"><input type="checkbox" id="df-chk-return-obstacles" /> Target halted by obstacles (2x losses)</label>
+              <label class="if-check"><input type="checkbox" id="df-chk-return-flank" /> Flank shot (2x losses)</label>
+            </div>
+            <p class="df-hint">Engagement continues each Play minute while the victim remains in range. End engagement to stop.</p>
+          </section>
+        </div>
+      </div>
+      <div class="if-modal-footer">
+        <div class="if-modal-footer-main">
+          <div class="if-total-line">Kill chance this minute (any selected shooter): <strong id="df-expected-kills">-</strong></div>
+        </div>
+        <div class="if-modal-footer-actions">
+          <button type="button" id="df-btn-end" class="game-modal-btn game-modal-btn--secondary" hidden>End engagement</button>
+          <button type="button" id="df-btn-engage" class="if-btn-fire">ENGAGE</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div id="spotreport-modal" class="game-modal" role="dialog" aria-modal="true" aria-labelledby="spotreport-modal-title" hidden>
     <div class="game-modal-backdrop"></div>
     <div class="game-modal-panel">

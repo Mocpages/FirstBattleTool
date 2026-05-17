@@ -77,6 +77,7 @@
   /** @type {Object.<string, { movement: number, dfRange: number, dfScore: number, ifRange: number, ifScore: number, ccScore: number }>} */
   var unitStatsByName = {};
   var artilleryStatsByName = {};
+  var logisticStatsByName = {};
   /** @type {Object.<string, L.Marker>} */
   var markerByKey = {};
   /**
@@ -95,12 +96,18 @@
   var acquisitionSilenced = {};
   /** Halted enemy within this many hexes (grid distance) of mover's hex → proximity acquisition. */
   var PROXIMITY_ACQUISITION_HEX_DISTANCE = 3;
-  /** @type {{ spotter: Unit, target: Unit, enteredHexKey: string, fromHexKey: string, spotKind?: string }[]} */
-  var acquisitionQueue = [];
-  var acquisitionFlowActive = false;
+  /** @type {{ targetKey: string, target: Unit, spotters: { spotter: Unit, enteredHexKey: string, fromHexKey: string, spotKind?: string }[], dfShooters: { shooter: Unit, enteredHexKey: string, fromHexKey: string }[] }[]} */
+  var contactEventQueue = [];
+  var contactFlowActive = false;
   var reportQueue = [];
   var reportFlowActive = false;
   var activeIfMission = null;
+  var activeDfMission = null;
+  var directFireEngagement = {
+    victim: null,
+    selectedShooterKeys: [],
+    candidates: [],
+  };
 
   /** From /api/bootstrap */
   var mvCostMeta = { loaded: false };
@@ -142,6 +149,8 @@
     u.positionSinceSimMs = su.positionSinceSimMs;
     u.ifExhausted = su.ifExhausted;
     u.ifCeaseFireSimMs = su.ifCeaseFireSimMs;
+    if (su.ammoAuthorized != null) u.ammoAuthorized = su.ammoAuthorized;
+    if (su.ammoOnHand != null) u.ammoOnHand = su.ammoOnHand;
     if (su.unitType != null) u.unitType = su.unitType;
     if (su.unitSize != null) u.unitSize = su.unitSize;
     if (su.bnFormation !== undefined) u.bnFormation = su.bnFormation;
@@ -170,21 +179,87 @@
     }
   }
 
-  function pushAcquisitionEventsFromApi(events) {
-    if (!events || !events.length) return;
+  function findContactGroupForTarget(target) {
+    var tk = unitKey(target.side, target);
     var i;
-    for (i = 0; i < events.length; i++) {
-      var ev = events[i];
-      var spotter = getUnitByKey(ev.spotter_key);
-      var target = getUnitByKey(ev.target_key);
-      if (!spotter || !target) continue;
-      acquisitionQueue.push({
-        spotter: spotter,
-        target: target,
-        enteredHexKey: ev.entered_hex_key,
-        fromHexKey: ev.from_hex_key,
-        spotKind: ev.spot_kind,
-      });
+    for (i = 0; i < contactEventQueue.length; i++) {
+      if (contactEventQueue[i].targetKey === tk) return contactEventQueue[i];
+    }
+    return null;
+  }
+
+  function getOrCreateContactGroup(target) {
+    var g = findContactGroupForTarget(target);
+    if (g) return g;
+    g = {
+      targetKey: unitKey(target.side, target),
+      target: target,
+      spotters: [],
+      dfShooters: [],
+    };
+    contactEventQueue.push(g);
+    return g;
+  }
+
+  function contactGroupHasSpotter(group, spotter, enteredHexKey, spotKind) {
+    var sk = unitKey(spotter.side, spotter);
+    var kind = spotKind || 'los';
+    var i;
+    for (i = 0; i < group.spotters.length; i++) {
+      var s = group.spotters[i];
+      if (
+        unitKey(s.spotter.side, s.spotter) === sk &&
+        s.enteredHexKey === enteredHexKey &&
+        (s.spotKind || 'los') === kind
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function contactGroupHasDfShooter(group, shooter, enteredHexKey) {
+    var sk = unitKey(shooter.side, shooter);
+    var i;
+    for (i = 0; i < group.dfShooters.length; i++) {
+      var d = group.dfShooters[i];
+      if (unitKey(d.shooter.side, d.shooter) === sk && d.enteredHexKey === enteredHexKey) return true;
+    }
+    return false;
+  }
+
+  function pushContactEventsFromApi(acquisitionEvents, dfEvents) {
+    var i;
+    if (acquisitionEvents && acquisitionEvents.length) {
+      for (i = 0; i < acquisitionEvents.length; i++) {
+        var ev = acquisitionEvents[i];
+        var spotter = getUnitByKey(ev.spotter_key);
+        var target = getUnitByKey(ev.target_key);
+        if (!spotter || !target) continue;
+        var g = getOrCreateContactGroup(target);
+        if (contactGroupHasSpotter(g, spotter, ev.entered_hex_key, ev.spot_kind)) continue;
+        g.spotters.push({
+          spotter: spotter,
+          enteredHexKey: ev.entered_hex_key,
+          fromHexKey: ev.from_hex_key,
+          spotKind: ev.spot_kind,
+        });
+      }
+    }
+    if (dfEvents && dfEvents.length) {
+      for (i = 0; i < dfEvents.length; i++) {
+        var dev = dfEvents[i];
+        var shooter = getUnitByKey(dev.shooter_key);
+        var victim = getUnitByKey(dev.victim_key);
+        if (!shooter || !victim) continue;
+        var g2 = getOrCreateContactGroup(victim);
+        if (contactGroupHasDfShooter(g2, shooter, dev.entered_hex_key)) continue;
+        g2.dfShooters.push({
+          shooter: shooter,
+          enteredHexKey: dev.entered_hex_key,
+          fromHexKey: dev.from_hex_key,
+        });
+      }
     }
   }
 
@@ -443,7 +518,7 @@
       playBtn.addEventListener('click', function (e) {
         if (e && e.preventDefault) e.preventDefault();
         if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
-        if (acquisitionFlowActive) return;
+        if (contactFlowActive) return;
         GameApi.simTick({ minutes_per_step: minutesPerStep })
           .then(function (data) {
             applyServerUnits(data.units);
@@ -453,10 +528,15 @@
               updateMinutesPerStepDisplay();
             }
             if (data.mpPerMinute != null) MP_PER_MINUTE = data.mpPerMinute;
-            pushAcquisitionEventsFromApi(data.newAcquisitionEvents);
+            pushContactEventsFromApi(data.newAcquisitionEvents, data.newDfOpportunityEvents);
             pushReportsFromApi(data.newReports);
             if (data.activeIfMission != null) activeIfMission = data.activeIfMission;
+            if (data.activeDfMission != null) activeDfMission = data.activeDfMission;
             updateIfMissionStatusLine();
+            updateDfMissionStatusLine();
+            if (activeDfMission && !activeDfMission.active && activeDfMission.endedSimMs) {
+              closeDirectFireModal();
+            }
             syncBattalionAggregateMarkers();
             var uu;
             for (uu = 0; uu < units.length; uu++) {
@@ -466,7 +546,7 @@
             redrawHexGrid();
             updateMarkerClasses();
             redrawRouteOverlay();
-            beginAcquisitionFlowIfQueued();
+            beginContactFlowIfQueued();
           })
           .catch(function (err) {
             console.error(err);
@@ -1370,21 +1450,10 @@
     }
   }
 
-  function acquisitionQueueHasEvent(target, enteredHexKey, spotter, spotKind) {
-    var qi;
-    var sk = spotKind || 'los';
-    for (qi = 0; qi < acquisitionQueue.length; qi++) {
-      var q = acquisitionQueue[qi];
-      if (
-        unitKey(q.target.side, q.target) === unitKey(target.side, target) &&
-        q.enteredHexKey === enteredHexKey &&
-        unitKey(q.spotter.side, q.spotter) === unitKey(spotter.side, spotter) &&
-        (q.spotKind || 'los') === sk
-      ) {
-        return true;
-      }
-    }
-    return false;
+  function contactQueueHasSpotter(target, enteredHexKey, spotter, spotKind) {
+    var g = findContactGroupForTarget(target);
+    if (!g) return false;
+    return contactGroupHasSpotter(g, spotter, enteredHexKey, spotKind);
   }
 
   function enqueueVisualAcquisitionIfAny(target, fromHexKey, enteredHexKey) {
@@ -1396,10 +1465,10 @@
       if (!Object.prototype.hasOwnProperty.call(losCells, enteredHexKey)) continue;
       var silKey = acquisitionSilenceKey(target, enteredHexKey, spotter);
       if (acquisitionSilenced[silKey]) continue;
-      if (acquisitionQueueHasEvent(target, enteredHexKey, spotter, 'los')) continue;
-      acquisitionQueue.push({
+      if (contactQueueHasSpotter(target, enteredHexKey, spotter, 'los')) continue;
+      var gLos = getOrCreateContactGroup(target);
+      gLos.spotters.push({
         spotter: spotter,
-        target: target,
         enteredHexKey: enteredHexKey,
         fromHexKey: fromHexKey,
         spotKind: 'los',
@@ -1419,10 +1488,10 @@
       if (hexKeyDistance(enteredHexKey, enemyHex) > PROXIMITY_ACQUISITION_HEX_DISTANCE) continue;
       var silKey = acquisitionSilenceKey(enemy, enteredHexKey, mover);
       if (acquisitionSilenced[silKey]) continue;
-      if (acquisitionQueueHasEvent(enemy, enteredHexKey, mover, 'proximity')) continue;
-      acquisitionQueue.push({
+      if (contactQueueHasSpotter(enemy, enteredHexKey, mover, 'proximity')) continue;
+      var gProx = getOrCreateContactGroup(enemy);
+      gProx.spotters.push({
         spotter: mover,
-        target: enemy,
         enteredHexKey: enteredHexKey,
         fromHexKey: fromHexKey,
         spotKind: 'proximity',
@@ -1635,100 +1704,225 @@
     modal.hidden = false;
   }
 
-  function resolveAcquisitionQueueHead(ev, confirm) {
-    GameApi.acquisitionResolve({
-      spotterKey: unitKey(ev.spotter.side, ev.spotter),
-      targetKey: unitKey(ev.target.side, ev.target),
-      enteredHexKey: ev.enteredHexKey,
-      fromHexKey: ev.fromHexKey,
-      spotKind: ev.spotKind || 'los',
-      confirm: confirm,
-    })
-      .then(function (res) {
-        if (confirm && res.spotReport) {
-          var target = getUnitByKey(ev.target.side ? unitKey(ev.target.side, ev.target) : ev.target.key);
+  function renderContactEventBody(group) {
+    var html =
+      '<p><strong>Target Unit:</strong> ' +
+      escapeHtmlLite(unitVerboseLabel(group.target)) +
+      '</p>';
+    if (group.spotters.length) {
+      html += '<p><strong>Spotting Unit(s):</strong></p><ul class="contact-event-list">';
+      var si;
+      for (si = 0; si < group.spotters.length; si++) {
+        var s = group.spotters[si];
+        html +=
+          '<li>' +
+          escapeHtmlLite(unitVerboseLabel(s.spotter)) +
+          (s.spotKind && s.spotKind !== 'los' ? ' (' + escapeHtmlLite(s.spotKind) + ')' : '') +
+          '</li>';
+      }
+      html += '</ul>';
+    }
+    if (group.dfShooters.length) {
+      html += '<p><strong>Direct fire opportunity — Shooter(s):</strong></p><ul class="contact-event-list">';
+      var di;
+      for (di = 0; di < group.dfShooters.length; di++) {
+        html +=
+          '<li>' + escapeHtmlLite(unitVerboseLabel(group.dfShooters[di].shooter)) + '</li>';
+      }
+      html += '</ul>';
+    }
+    return html;
+  }
+
+  function resolveContactGroupDeny(group) {
+    var promises = [];
+    var i;
+    for (i = 0; i < group.spotters.length; i++) {
+      var s = group.spotters[i];
+      promises.push(
+        GameApi.acquisitionResolve({
+          spotterKey: unitKey(s.spotter.side, s.spotter),
+          targetKey: unitKey(group.target.side, group.target),
+          enteredHexKey: s.enteredHexKey,
+          fromHexKey: s.fromHexKey,
+          spotKind: s.spotKind || 'los',
+          confirm: false,
+        }),
+      );
+    }
+    for (i = 0; i < group.dfShooters.length; i++) {
+      var d = group.dfShooters[i];
+      promises.push(
+        GameApi.directFireOpportunityResolve({
+          shooterKey: unitKey(d.shooter.side, d.shooter),
+          victimKey: unitKey(group.target.side, group.target),
+          enteredHexKey: d.enteredHexKey,
+          fromHexKey: d.fromHexKey,
+          confirm: false,
+        }),
+      );
+    }
+    return Promise.all(promises);
+  }
+
+  function resolveContactGroupConfirmSpotting(group) {
+    var promises = [];
+    var i;
+    for (i = 0; i < group.spotters.length; i++) {
+      var s = group.spotters[i];
+      promises.push(
+        GameApi.acquisitionResolve({
+          spotterKey: unitKey(s.spotter.side, s.spotter),
+          targetKey: unitKey(group.target.side, group.target),
+          enteredHexKey: s.enteredHexKey,
+          fromHexKey: s.fromHexKey,
+          spotKind: s.spotKind || 'los',
+          confirm: i === 0,
+        }),
+      );
+    }
+    return Promise.all(promises);
+  }
+
+  function finishContactGroupStep() {
+    if (contactEventQueue.length) contactEventQueue.shift();
+    hideAcquisitionModal();
+    contactDrainStep();
+  }
+
+  function advanceContactGroupAfterSpotting(group) {
+    group.spotters = [];
+    hideAcquisitionModal();
+    if (group.dfShooters.length) {
+      contactDrainStep();
+    } else {
+      finishContactGroupStep();
+    }
+  }
+
+  function resolveContactGroupConfirmSpottingFlow(group) {
+    resolveContactGroupConfirmSpotting(group)
+      .then(function (results) {
+        var spotReport = null;
+        var ri;
+        for (ri = 0; ri < results.length; ri++) {
+          if (results[ri] && results[ri].spotReport) {
+            spotReport = results[ri].spotReport;
+            break;
+          }
+        }
+        if (spotReport) {
+          var target = group.target;
           if (target) {
             target.spotted = true;
             refreshUnitMarkerIcon(target);
           }
-          showSpotReportFromApi(res.spotReport);
+          showSpotReportFromApi(spotReport);
           var okBtn = document.getElementById('spotreport-ok');
           function onSpotOk() {
             if (okBtn) okBtn.removeEventListener('click', onSpotOk);
             hideSpotReportModal();
-            if (acquisitionQueue.length) acquisitionQueue.shift();
-            hideAcquisitionModal();
-            acquisitionDrainStep();
+            advanceContactGroupAfterSpotting(group);
           }
           if (okBtn) okBtn.addEventListener('click', onSpotOk);
           return;
         }
-        if (acquisitionQueue.length) acquisitionQueue.shift();
-        hideAcquisitionModal();
-        acquisitionDrainStep();
+        advanceContactGroupAfterSpotting(group);
       })
       .catch(function (err) {
         setStatus('Acquisition resolve failed: ' + err.message);
-        if (acquisitionQueue.length) acquisitionQueue.shift();
-        hideAcquisitionModal();
-        acquisitionDrainStep();
+        advanceContactGroupAfterSpotting(group);
       });
   }
 
-  function acquisitionDrainStep() {
-    var ev = acquisitionQueue[0];
-    if (!ev) {
-      acquisitionFlowActive = false;
+  function contactDrainStep() {
+    var group = contactEventQueue[0];
+    if (!group) {
+      contactFlowActive = false;
       setPlayButtonAcquisitionDisabled(false);
       return;
     }
     resetAcquisitionModalPanelLayout();
-    map.panTo(L.latLng(ev.target.lat, ev.target.lon));
+    map.panTo(L.latLng(group.target.lat, group.target.lon));
     var body = document.getElementById('acquisition-modal-body');
     var modal = document.getElementById('acquisition-modal');
+    var titleEl = document.getElementById('acquisition-modal-title');
     if (!body || !modal) {
-      acquisitionQueue.length = 0;
-      acquisitionFlowActive = false;
+      contactEventQueue.length = 0;
+      contactFlowActive = false;
       setPlayButtonAcquisitionDisabled(false);
       return;
     }
-    body.innerHTML =
-      '<p><strong>Spotting Unit:</strong> ' +
-      escapeHtmlLite(unitVerboseLabel(ev.spotter)) +
-      '</p>' +
-      '<p><strong>Target Unit:</strong> ' +
-      escapeHtmlLite(unitVerboseLabel(ev.target)) +
-      '</p>';
+    if (titleEl) {
+      titleEl.textContent =
+        group.spotters.length && group.dfShooters.length
+          ? 'Potential contact event'
+          : group.dfShooters.length
+            ? 'Direct fire engagement opportunity'
+            : 'Potential Acquisition Event';
+    }
+    body.innerHTML = renderContactEventBody(group);
     modal.hidden = false;
 
     var denyBtn = document.getElementById('acquisition-deny');
     var confBtn = document.getElementById('acquisition-confirm');
+    var engageBtn = document.getElementById('acquisition-engage-df');
+    if (confBtn) confBtn.hidden = !group.spotters.length;
+    if (engageBtn) engageBtn.hidden = !group.dfShooters.length;
 
-    function cleanupAcquisitionButtons() {
+    function cleanupContactButtons() {
       if (denyBtn) denyBtn.removeEventListener('click', onDeny);
-      if (confBtn) confBtn.removeEventListener('click', onConfirm);
+      if (confBtn) confBtn.removeEventListener('click', onConfirmSpotting);
+      if (engageBtn) engageBtn.removeEventListener('click', onEngageDf);
     }
 
     function onDeny() {
-      cleanupAcquisitionButtons();
-      resolveAcquisitionQueueHead(ev, false);
+      cleanupContactButtons();
+      resolveContactGroupDeny(group)
+        .catch(function () {})
+        .then(function () {
+          finishContactGroupStep();
+        });
     }
 
-    function onConfirm() {
-      cleanupAcquisitionButtons();
+    function onConfirmSpotting() {
+      cleanupContactButtons();
       hideAcquisitionModal();
-      resolveAcquisitionQueueHead(ev, true);
+      resolveContactGroupConfirmSpottingFlow(group);
+    }
+
+    function onEngageDf() {
+      cleanupContactButtons();
+      hideAcquisitionModal();
+      var shooters = [];
+      var spottersLeft = group.spotters.slice();
+      var ei;
+      for (ei = 0; ei < group.dfShooters.length; ei++) {
+        shooters.push(group.dfShooters[ei].shooter);
+      }
+      if (contactEventQueue.length) contactEventQueue.shift();
+      if (spottersLeft.length) {
+        contactEventQueue.unshift({
+          targetKey: group.targetKey,
+          target: group.target,
+          spotters: spottersLeft,
+          dfShooters: [],
+        });
+      }
+      openDirectFireModal(group.target, shooters);
+      contactDrainStep();
     }
 
     if (denyBtn) denyBtn.addEventListener('click', onDeny);
-    if (confBtn) confBtn.addEventListener('click', onConfirm);
+    if (confBtn && group.spotters.length) confBtn.addEventListener('click', onConfirmSpotting);
+    if (engageBtn && group.dfShooters.length) engageBtn.addEventListener('click', onEngageDf);
   }
 
-  function beginAcquisitionFlowIfQueued() {
-    if (!acquisitionQueue.length) return;
-    acquisitionFlowActive = true;
+  function beginContactFlowIfQueued() {
+    if (!contactEventQueue.length || contactFlowActive) return;
+    contactFlowActive = true;
     setPlayButtonAcquisitionDisabled(true);
-    acquisitionDrainStep();
+    contactDrainStep();
   }
 
   function refreshUnitMarkerIcon(u) {
@@ -3443,6 +3637,7 @@
       if (cfg.hexOriginLon != null) hexOriginLon = cfg.hexOriginLon;
       unitStatsByName = data.unitStats || data.maneuverStats || {};
       artilleryStatsByName = data.artilleryStats || {};
+      logisticStatsByName = data.logisticStats || {};
       syncMvCostMetaFromBootstrap(data.mvCost);
       if (data.simInstantMs != null) simInstantMs = data.simInstantMs;
       if (cfg.minuteMs != null) MINUTE_MS = cfg.minuteMs;
@@ -3453,9 +3648,11 @@
       if (data.minutesPerStep != null) minutesPerStep = data.minutesPerStep;
       if (data.mpPerMinute != null) MP_PER_MINUTE = data.mpPerMinute;
       if (data.activeIfMission != null) activeIfMission = data.activeIfMission;
+      if (data.activeDfMission != null) activeDfMission = data.activeDfMission;
       updateMinutesPerStepDisplay();
       updateTimebarFromApi(data.timebar, data.simInstantMs);
       updateIfMissionStatusLine();
+      updateDfMissionStatusLine();
       if (!data.mvCost || !data.mvCost.loaded) {
         var fr = (data.mvCost && data.mvCost.failureReason) || '';
         setStatus(
@@ -3546,6 +3743,345 @@
       if (weapons.length) groups.push({ unit: u, weapons: weapons });
     }
     return groups;
+  }
+
+  function dfPkPerMinute(dfs, dugIn, obstacles, flank) {
+    var m = 1.0;
+    if (dugIn) m *= 0.5;
+    if (obstacles) m *= 2.0;
+    if (flank) m *= 2.0;
+    var pk = ((0.14333 * dfs + 0.17) / 7) * m;
+    return pk > 1 ? 1 : pk < 0 ? 0 : pk;
+  }
+
+  function refreshDfExpectedKills() {
+    var el = document.getElementById('df-expected-kills');
+    if (!el) return;
+    var dug = document.getElementById('df-chk-target-dug-in');
+    var obs = document.getElementById('df-chk-target-obstacles');
+    var flank = document.getElementById('df-chk-target-flank');
+    var dugIn = dug && dug.checked;
+    var obstacles = obs && obs.checked;
+    var flankShot = flank && flank.checked;
+    if (!directFireEngagement.selectedShooterKeys.length) {
+      el.textContent = '—';
+      return;
+    }
+    var pNone = 1.0;
+    var i;
+    for (i = 0; i < directFireEngagement.selectedShooterKeys.length; i++) {
+      var u = getUnitByKey(directFireEngagement.selectedShooterKeys[i]);
+      if (!u) continue;
+      var pk = dfPkPerMinute(u.totalDirectFire || 0, dugIn, obstacles, flankShot);
+      pNone *= 1.0 - pk;
+    }
+    var pAny = 1.0 - pNone;
+    el.textContent = (pAny * 100).toFixed(1) + '%';
+  }
+
+  function updateDfMissionStatusLine() {
+    var line = document.getElementById('df-mission-status');
+    var btnEnd = document.getElementById('df-btn-end');
+    var btnEngage = document.getElementById('df-btn-engage');
+    if (activeDfMission && activeDfMission.active) {
+      if (line) {
+        line.hidden = false;
+        var n = (activeDfMission.shooterKeys || []).length;
+        line.textContent =
+          'Direct fire in progress — ' +
+          n +
+          ' shooter(s). Continues each Play minute while victim stays in range.';
+      }
+      if (btnEnd) btnEnd.hidden = false;
+      if (btnEngage) btnEngage.hidden = true;
+    } else {
+      if (line) {
+        if (activeDfMission && activeDfMission.endedSimMs) {
+          line.hidden = false;
+          var reason = activeDfMission.endReason || 'complete';
+          line.textContent =
+            'Direct fire ended (' +
+            reason.replace(/_/g, ' ') +
+            '). After-action reports issued.';
+        } else {
+          line.hidden = true;
+          line.textContent = '';
+        }
+      }
+      if (btnEnd) btnEnd.hidden = true;
+      if (btnEngage) btnEngage.hidden = false;
+    }
+  }
+
+  function hideDirectFireModal() {
+    var modal = document.getElementById('direct-fire-modal');
+    if (modal) modal.hidden = true;
+  }
+
+  function closeDirectFireModal() {
+    hideDirectFireModal();
+    if (activeDfMission && activeDfMission.active) return;
+    directFireEngagement.victim = null;
+    directFireEngagement.selectedShooterKeys = [];
+    directFireEngagement.candidates = [];
+    updateDfMissionStatusLine();
+  }
+
+  function isDfShooterSelected(unitKey) {
+    var i;
+    for (i = 0; i < directFireEngagement.selectedShooterKeys.length; i++) {
+      if (directFireEngagement.selectedShooterKeys[i] === unitKey) return true;
+    }
+    return false;
+  }
+
+  function renderDfSelectedShooters() {
+    var ul = document.getElementById('df-selected-shooters');
+    if (!ul) return;
+    ul.innerHTML = '';
+    if (!directFireEngagement.selectedShooterKeys.length) {
+      var li0 = document.createElement('li');
+      li0.textContent = 'No shooters selected.';
+      ul.appendChild(li0);
+      return;
+    }
+    var i;
+    for (i = 0; i < directFireEngagement.selectedShooterKeys.length; i++) {
+      var uk = directFireEngagement.selectedShooterKeys[i];
+      var u = getUnitByKey(uk);
+      var li = document.createElement('li');
+      li.textContent = u ? unitVerboseLabel(u) : uk;
+      ul.appendChild(li);
+    }
+  }
+
+  function renderDfCandidateList() {
+    var ul = document.getElementById('df-candidate-list');
+    if (!ul) return;
+    ul.innerHTML = '';
+    var list = directFireEngagement.candidates;
+    if (!list.length) {
+      var li0 = document.createElement('li');
+      li0.className = 'if-candidate-empty';
+      li0.style.cssText = 'font-size:13px;color:#64748b;padding:8px;';
+      li0.textContent = 'No enemy units with direct fire in range of the victim.';
+      ul.appendChild(li0);
+      return;
+    }
+    var ci;
+    for (ci = 0; ci < list.length; ci++) {
+      var c = list[ci];
+      var li = document.createElement('li');
+      li.className = 'if-candidate-item';
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'if-candidate-btn';
+      btn.setAttribute('data-df-candidate-index', String(ci));
+      var sel = isDfShooterSelected(c.unitKey);
+      btn.textContent =
+        c.company +
+        ' — DF ' +
+        formatCombatScoreNumber(c.dfScore) +
+        ' @ ' +
+        c.distKm.toFixed(1) +
+        ' km' +
+        (sel ? ' ✓' : '');
+      li.appendChild(btn);
+      ul.appendChild(li);
+    }
+  }
+
+  function toggleDfShooter(candidate) {
+    var uk = candidate.unitKey;
+    if (isDfShooterSelected(uk)) {
+      directFireEngagement.selectedShooterKeys = directFireEngagement.selectedShooterKeys.filter(
+        function (k) {
+          return k !== uk;
+        },
+      );
+    } else {
+      directFireEngagement.selectedShooterKeys.push(uk);
+    }
+    renderDfCandidateList();
+    renderDfSelectedShooters();
+    refreshDfExpectedKills();
+  }
+
+  function buildDirectFirePayload() {
+    var victim = directFireEngagement.victim;
+    if (!victim || !directFireEngagement.selectedShooterKeys.length) return null;
+    var respEl = document.querySelector('input[name="df-victim-response"]:checked');
+    var resp = respEl ? respEl.value : 'continue_moving';
+    function chk(id) {
+      var el = document.getElementById(id);
+      return el && el.checked;
+    }
+    return {
+      shooter_keys: directFireEngagement.selectedShooterKeys.slice(),
+      victim_key: unitKey(victim.side, victim),
+      victim_response: resp,
+      target_dug_in: chk('df-chk-target-dug-in'),
+      target_halted_obstacles: chk('df-chk-target-obstacles'),
+      target_flank_shot: chk('df-chk-target-flank'),
+      return_dug_in: chk('df-chk-return-dug-in'),
+      return_halted_obstacles: chk('df-chk-return-obstacles'),
+      return_flank_shot: chk('df-chk-return-flank'),
+    };
+  }
+
+  function openDirectFireModal(victimPreset, shooterPreset) {
+    var victim = victimPreset || getSelectedCompanyUnit();
+    if (!victim) {
+      setStatus('Select a friendly company (victim) or confirm a DF opportunity.');
+      return;
+    }
+    cancelMagicMove();
+    directFireEngagement.victim = victim;
+    directFireEngagement.selectedShooterKeys = [];
+    if (shooterPreset) {
+      if (Array.isArray(shooterPreset)) {
+        var pi;
+        for (pi = 0; pi < shooterPreset.length; pi++) {
+          directFireEngagement.selectedShooterKeys.push(
+            unitKey(shooterPreset[pi].side, shooterPreset[pi]),
+          );
+        }
+      } else {
+        directFireEngagement.selectedShooterKeys.push(unitKey(shooterPreset.side, shooterPreset));
+      }
+    }
+
+    var line = document.getElementById('df-modal-engagement-line');
+    if (line) {
+      line.textContent =
+        'Victim: ' + victim.company + ' — ' + victim.battalion + ' (' + victim.side + ')';
+    }
+    renderDfSelectedShooters();
+    updateDfMissionStatusLine();
+
+    GameApi.directFireCandidates(unitKey(victim.side, victim))
+      .then(function (data) {
+        directFireEngagement.candidates = (data.candidates || []).map(function (c) {
+          return {
+            unit: getUnitByKey(c.unitKey),
+            unitKey: c.unitKey,
+            company: c.company,
+            battalion: c.battalion,
+            side: c.side,
+            dfScore: c.dfScore,
+            dfRangeKm: c.dfRangeKm,
+            distKm: c.distKm,
+            activity: c.activity,
+          };
+        });
+        renderDfCandidateList();
+        renderDfSelectedShooters();
+        refreshDfExpectedKills();
+        var modal = document.getElementById('direct-fire-modal');
+        if (modal) modal.hidden = false;
+      })
+      .catch(function (err) {
+        setStatus('Direct fire setup failed: ' + err.message);
+      });
+  }
+
+  function executeDirectFireMission() {
+    if (!directFireEngagement.victim || !directFireEngagement.selectedShooterKeys.length) {
+      setStatus('Direct fire: select at least one shooter and a victim.');
+      return;
+    }
+    var payload = buildDirectFirePayload();
+    if (!payload) return;
+    GameApi.directFireResolve(payload)
+      .then(function (res) {
+        applyServerUnits(res.units);
+        activeDfMission = res.activeDfMission || null;
+        var uu;
+        for (uu = 0; uu < units.length; uu++) {
+          refreshUnitMarkerIcon(units[uu]);
+        }
+        updateDfMissionStatusLine();
+        setStatus(res.message || 'Direct fire engagement started.');
+      })
+      .catch(function (err) {
+        setStatus('Direct fire failed: ' + err.message);
+      });
+  }
+
+  function endDirectFireMission() {
+    GameApi.directFireCancel()
+      .then(function (res) {
+        applyServerUnits(res.units);
+        activeDfMission = res.activeDfMission || null;
+        pushReportsFromApi(res.newReports);
+        var uu;
+        for (uu = 0; uu < units.length; uu++) {
+          refreshUnitMarkerIcon(units[uu]);
+        }
+        updateDfMissionStatusLine();
+        setStatus(res.message || 'Direct fire engagement ended.');
+        closeDirectFireModal();
+      })
+      .catch(function (err) {
+        setStatus('End direct fire failed: ' + err.message);
+      });
+  }
+
+  function initDirectFireModal() {
+    var modal = document.getElementById('direct-fire-modal');
+    if (!modal || modal.getAttribute('data-df-init') === '1') return;
+    modal.setAttribute('data-df-init', '1');
+    var btnClose = document.getElementById('df-modal-close');
+    var btnEngage = document.getElementById('df-btn-engage');
+    var list = document.getElementById('df-candidate-list');
+    var returnMods = document.getElementById('df-return-mods');
+    var modIds = [
+      'df-chk-target-dug-in',
+      'df-chk-target-obstacles',
+      'df-chk-target-flank',
+    ];
+    var mi;
+    function syncReturnMods() {
+      var respEl = document.querySelector('input[name="df-victim-response"]:checked');
+      if (returnMods) returnMods.hidden = !respEl || respEl.value !== 'return_fire';
+    }
+    if (btnClose) {
+      btnClose.addEventListener('click', function () {
+        if (activeDfMission && activeDfMission.active) {
+          hideDirectFireModal();
+          setStatus('Direct fire engagement continues. Reopen from Enemy orders → Direct fire or End engagement.');
+        } else {
+          setStatus('Direct fire setup closed.');
+          closeDirectFireModal();
+        }
+      });
+    }
+    var btnEnd = document.getElementById('df-btn-end');
+    if (btnEnd) btnEnd.addEventListener('click', endDirectFireMission);
+    if (btnEngage) btnEngage.addEventListener('click', executeDirectFireMission);
+    var radios = document.querySelectorAll('input[name="df-victim-response"]');
+    for (mi = 0; mi < radios.length; mi++) {
+      radios[mi].addEventListener('change', syncReturnMods);
+    }
+    for (mi = 0; mi < modIds.length; mi++) {
+      var mel = document.getElementById(modIds[mi]);
+      if (mel) mel.addEventListener('change', refreshDfExpectedKills);
+    }
+    if (list) {
+      list.addEventListener('click', function (ev) {
+        var btn = ev.target && ev.target.closest ? ev.target.closest('[data-df-candidate-index]') : null;
+        if (!btn) return;
+        var idx = parseInt(btn.getAttribute('data-df-candidate-index'), 10);
+        if (isNaN(idx)) return;
+        var cand = directFireEngagement.candidates[idx];
+        if (cand) toggleDfShooter(cand);
+      });
+    }
+    syncReturnMods();
+  }
+
+  function initDfOpportunityModal() {
+    initModalDrag('df-opportunity-modal', 'df-opportunity-modal-title');
   }
 
   function closeIndirectFireModal() {
@@ -4017,9 +4553,25 @@
     if (modal) modal.hidden = true;
   }
 
+  function formatAmmoTons(n) {
+    if (!isFinite(n)) return '0';
+    var r = Math.round(n * 100) / 100;
+    if (Math.abs(r - Math.round(r)) < 1e-9) return String(Math.round(r));
+    return String(r);
+  }
+
+  function ammoPercentCssClass(pct) {
+    if (pct == null || !isFinite(pct)) return '';
+    if (pct > 75) return 'unit-info-ammo-pct--high';
+    if (pct >= 50) return 'unit-info-ammo-pct--mid';
+    if (pct >= 25) return 'unit-info-ammo-pct--low';
+    return 'unit-info-ammo-pct--critical';
+  }
+
   function buildUnitInfoHtml(data) {
     var u = data.unit || {};
     var esc = escapeHtmlLite;
+    var ammo = data.ammunition || {};
     var rows = [
       ['Company', u.company],
       ['Battalion', u.battalion],
@@ -4047,6 +4599,21 @@
     for (ri = 0; ri < rows.length; ri++) {
       html += '<dt>' + esc(String(rows[ri][0])) + '</dt><dd>' + esc(String(rows[ri][1])) + '</dd>';
     }
+    if (ammo.authorized != null && ammo.authorized > 0) {
+      var pct = ammo.percent;
+      var pctCls = ammoPercentCssClass(pct);
+      var pctLabel = pct != null && isFinite(pct) ? Math.round(pct) + '%' : '—';
+      html +=
+        '<dt>Ammunition</dt><dd class="unit-info-ammo-line">' +
+        esc(formatAmmoTons(ammo.authorized)) +
+        ' | ' +
+        esc(formatAmmoTons(ammo.onHand != null ? ammo.onHand : 0)) +
+        ' | <span class="unit-info-ammo-pct ' +
+        esc(pctCls) +
+        '">' +
+        esc(pctLabel) +
+        '</span></dd>';
+    }
     html += '</dl></section>';
     var equip = data.equipment || [];
     html += '<section class="unit-info-section"><h3>Equipment</h3>';
@@ -4055,19 +4622,36 @@
     } else {
       html +=
         '<table class="unit-info-equip-table"><thead><tr>' +
-        '<th>Type</th><th>Qty</th><th>MV</th><th>DF rng</th><th>DF</th><th>IF rng</th><th>IF</th><th>CC</th>' +
+        '<th>Type</th><th>Qty</th><th>MV</th><th>DF rng</th><th>DF</th><th>IF rng</th><th>IF</th><th>CC</th><th>Ammo / cargo</th>' +
         '</tr></thead><tbody>';
       var ei;
       for (ei = 0; ei < equip.length; ei++) {
         var eq = equip[ei];
         var st = eq.stats || {};
+        var ammoCargo = '—';
+        if (eq.logistics) {
+          ammoCargo =
+            'Dry ' +
+            formatAmmoTons(eq.logistics.dryCargoTons) +
+            ' t · Fuel ' +
+            formatAmmoTons(eq.logistics.fuelLiters) +
+            ' L';
+        } else if (eq.ammunition && eq.ammunition.ammoTons > 0) {
+          ammoCargo = formatAmmoTons(eq.ammunition.ammoTons) + ' t / veh';
+        } else if (eq.artillery && eq.artillery.ammoTons > 0) {
+          ammoCargo =
+            formatAmmoTons(eq.artillery.ammoTons) +
+            ' t · ' +
+            formatAmmoTons(eq.artillery.tonsPerRound) +
+            ' t/rd';
+        }
         html +=
           '<tr><td>' +
           esc(eq.name) +
           '</td><td>' +
           esc(String(eq.count)) +
           '</td><td>' +
-          esc(st.movement != null ? String(st.movement) : '—') +
+          esc(st.movement != null ? String(st.movement) : eq.logistics ? String(eq.logistics.movement) : '—') +
           '</td><td>' +
           esc(st.dfRange != null ? String(st.dfRange) : '—') +
           '</td><td>' +
@@ -4078,11 +4662,13 @@
           esc(st.ifScore != null ? String(st.ifScore) : '—') +
           '</td><td>' +
           esc(st.ccScore != null ? String(st.ccScore) : '—') +
+          '</td><td>' +
+          esc(ammoCargo) +
           '</td></tr>';
         if (eq.artillery) {
           var ar = eq.artillery;
           html +=
-            '<tr class="unit-info-artillery-detail"><td colspan="8">Emplacement ' +
+            '<tr class="unit-info-artillery-detail"><td colspan="9">Emplacement ' +
             esc(String(ar.emplacementTimeMin)) +
             ' min · Displace ' +
             esc(String(ar.displacementTimeMin)) +
@@ -4161,7 +4747,7 @@
         return;
       }
       if (act === 'enemy-direct-fire') {
-        setStatus('Enemy order — direct fire (not implemented).');
+        openDirectFireModal();
         return;
       }
       if (act === 'enemy-assault') {
@@ -4180,6 +4766,8 @@
   }
 
   initIndirectFireModal();
+  initDirectFireModal();
+  initDfOpportunityModal();
   initUnitInfoModal();
   initBattalionMoveModal();
   initOrderMenus();

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -20,6 +20,14 @@ app.add_middleware(
 )
 
 game = GameState()
+
+
+def _require_unit(unit_key: str) -> dict[str, Any]:
+    """Resolve unit by key (battalion names may contain '/')."""
+    u = game.get_unit(unit_key)
+    if not u:
+        raise HTTPException(404, "Unit not found")
+    return u
 
 
 @app.on_event("startup")
@@ -55,6 +63,27 @@ class AcquisitionResolveBody(BaseModel):
     from_hex_key: str
     spot_kind: str
     confirm: bool
+
+
+class DFOpportunityResolveBody(BaseModel):
+    shooter_key: str
+    victim_key: str
+    entered_hex_key: str
+    from_hex_key: str = ""
+    confirm: bool
+
+
+class DirectFireResolveBody(BaseModel):
+    shooter_keys: list[str] = Field(default_factory=list)
+    shooter_key: str = ""
+    victim_key: str
+    victim_response: str = "continue_moving"
+    target_dug_in: bool = False
+    target_halted_obstacles: bool = False
+    target_flank_shot: bool = False
+    return_dug_in: bool = False
+    return_halted_obstacles: bool = False
+    return_flank_shot: bool = False
 
 
 class IFFiringRow(BaseModel):
@@ -135,8 +164,8 @@ def sim_tick(body: Optional[SimTickBody] = None) -> dict[str, Any]:
     return game.sim_tick(minutes)
 
 
-@app.get("/api/units/{unit_key}/info")
-def unit_info(unit_key: str) -> dict[str, Any]:
+@app.get("/api/units/info")
+def unit_info(unit_key: str = Query(..., alias="unit_key")) -> dict[str, Any]:
     info = game.unit_info(unit_key)
     if not info:
         raise HTTPException(404, "Unit not found")
@@ -148,6 +177,85 @@ def acquisition_queue() -> dict[str, Any]:
     from dataclasses import asdict
 
     return {"events": [asdict(e) for e in game._acquisition_queue]}
+
+
+@app.get("/api/direct-fire/candidates")
+def df_candidates(victim_key: str) -> dict[str, Any]:
+    victim = game.get_unit(victim_key)
+    if not victim:
+        raise HTTPException(404, "Victim unit not found")
+    candidates = game.direct_fire.candidate_shooters(game.units, victim)
+    return {
+        "victimKey": victim_key,
+        "candidates": [
+            {
+                "unitKey": c.unit_key,
+                "company": c.company,
+                "battalion": c.battalion,
+                "side": c.side,
+                "dfScore": c.df_score,
+                "dfRangeKm": c.df_range_km,
+                "distKm": c.dist_km,
+                "activity": c.activity,
+            }
+            for c in candidates
+        ],
+    }
+
+
+@app.post("/api/direct-fire/opportunity/resolve")
+def df_opportunity_resolve(body: DFOpportunityResolveBody) -> dict[str, Any]:
+    return game.resolve_df_opportunity(
+        body.shooter_key,
+        body.victim_key,
+        body.entered_hex_key,
+        body.confirm,
+    )
+
+
+@app.post("/api/direct-fire/resolve")
+def df_resolve(body: DirectFireResolveBody) -> dict[str, Any]:
+    keys = list(body.shooter_keys) if body.shooter_keys else []
+    if body.shooter_key and body.shooter_key not in keys:
+        keys.insert(0, body.shooter_key)
+    err, _ = game.start_df_mission(
+        keys,
+        body.victim_key,
+        body.victim_response,
+        body.target_dug_in,
+        body.target_halted_obstacles,
+        body.target_flank_shot,
+        body.return_dug_in,
+        body.return_halted_obstacles,
+        body.return_flank_shot,
+    )
+    if err:
+        raise HTTPException(400, err)
+    mission = game.df_mission.get_mission()
+    return {
+        "ok": True,
+        "message": (
+            "Direct fire engagement started. Use Play each minute; "
+            "continues while the victim stays in range. Cancel to end."
+        ),
+        "units": game.units,
+        "activeDfMission": mission.to_api_dict() if mission else None,
+    }
+
+
+@app.post("/api/direct-fire/cancel")
+def df_cancel() -> dict[str, Any]:
+    err, result = game.cancel_df_mission()
+    if err:
+        raise HTTPException(400, err)
+    return {
+        "ok": True,
+        "message": "Direct fire engagement ended.",
+        "units": game.units,
+        "activeDfMission": None,
+        "endReason": result.get("endReason"),
+        "newReports": result.get("reports") or [],
+    }
 
 
 @app.post("/api/acquisition/resolve")
@@ -164,47 +272,45 @@ def acquisition_resolve(body: AcquisitionResolveBody) -> dict[str, Any]:
     return game.resolve_acquisition(ev, body.confirm)
 
 
-@app.post("/api/units/{unit_key}/move-order")
-def move_order(unit_key: str, body: MoveOrderBody) -> dict[str, Any]:
-    u = game.get_unit(unit_key)
-    if not u:
-        raise HTTPException(404, "Unit not found")
+@app.post("/api/units/move-order")
+def move_order(
+    body: MoveOrderBody, unit_key: str = Query(..., alias="unit_key")
+) -> dict[str, Any]:
+    u = _require_unit(unit_key)
     err = game.extend_route(u, body.goal_key) if body.extend else game.assign_move_order(u, body.goal_key)
     return {"ok": err is None, "message": err, "unit": u}
 
 
-@app.post("/api/units/{unit_key}/clear-route")
-def clear_route(unit_key: str) -> dict[str, Any]:
-    u = game.get_unit(unit_key)
-    if not u:
-        raise HTTPException(404, "Unit not found")
+@app.post("/api/units/clear-route")
+def clear_route(unit_key: str = Query(..., alias="unit_key")) -> dict[str, Any]:
+    u = _require_unit(unit_key)
     game.clear_route(u)
     return {"ok": True, "unit": u}
 
 
-@app.post("/api/units/{unit_key}/magic-move")
-def magic_move(unit_key: str, body: MagicMoveBody) -> dict[str, Any]:
-    u = game.get_unit(unit_key)
-    if not u:
-        raise HTTPException(404, "Unit not found")
+@app.post("/api/units/magic-move")
+def magic_move(
+    body: MagicMoveBody, unit_key: str = Query(..., alias="unit_key")
+) -> dict[str, Any]:
+    u = _require_unit(unit_key)
     game.magic_move(u, body.lat, body.lon)
     return {"ok": True, "unit": u}
 
 
-@app.post("/api/units/{unit_key}/remove-waypoint")
-def remove_waypoint(unit_key: str, body: WaypointRemoveBody) -> dict[str, Any]:
-    u = game.get_unit(unit_key)
-    if not u:
-        raise HTTPException(404, "Unit not found")
+@app.post("/api/units/remove-waypoint")
+def remove_waypoint(
+    body: WaypointRemoveBody, unit_key: str = Query(..., alias="unit_key")
+) -> dict[str, Any]:
+    u = _require_unit(unit_key)
     err = game.remove_waypoint(u, body.index)
     return {"ok": err is None, "message": err, "unit": u}
 
 
-@app.post("/api/units/{unit_key}/waypoint")
-def waypoint(unit_key: str, body: WaypointBody) -> dict[str, Any]:
-    u = game.get_unit(unit_key)
-    if not u:
-        raise HTTPException(404, "Unit not found")
+@app.post("/api/units/waypoint")
+def waypoint(
+    body: WaypointBody, unit_key: str = Query(..., alias="unit_key")
+) -> dict[str, Any]:
+    u = _require_unit(unit_key)
     err = game.apply_waypoint_drag(u, body.kind, body.via_index, body.lat, body.lon)
     return {"ok": err is None, "message": err, "unit": u}
 

@@ -6,7 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.artillery_fire import MAX_RATE_BURST_MINUTES, apply_fire_mission, is_artillery_emplaced
-from backend.combat import UnitStatsCatalog, format_score, refresh_unit_combat_totals
+from backend.combat import (
+    UnitStatsCatalog,
+    ammo_percent,
+    cap_artillery_rounds_by_ammo,
+    format_score,
+    lose_equipment_ammunition,
+    refresh_unit_combat_totals,
+)
 from backend.reports import ReportService
 
 HARD_TARGET_KILL_FACTOR = 0.05
@@ -214,13 +221,20 @@ class IFMissionManager:
             if volleys <= 0:
                 continue
 
-            physical = volleys * firer.tube_count
-            firer.volleys_remaining -= volleys
-            firer.total_volleys_fired += volleys
+            desired_physical = volleys * firer.tube_count
+            physical, _tons = cap_artillery_rounds_by_ammo(u, art, desired_physical)
+            if physical <= 0:
+                firer.active = False
+                continue
+
+            volleys_used = max(1, (physical + firer.tube_count - 1) // firer.tube_count)
+            volleys_used = min(volleys, volleys_used)
+            firer.volleys_remaining -= volleys_used
+            firer.total_volleys_fired += volleys_used
             firer.total_rounds_fired += physical
             self.mission.total_rounds_fired += physical
 
-            minute_ifs += volleys * firer.tube_count * firer.if_score * mul
+            minute_ifs += physical * firer.if_score * mul
 
             if used_max_minute and firer.max_burst_minutes_used >= MAX_RATE_BURST_MINUTES:
                 u["ifExhausted"] = True
@@ -247,6 +261,9 @@ class IFMissionManager:
             self.mission.ended_sim_ms = sim_ms
             shelrep = self._build_shelrep(target, clock_main_line_fn, mgrs_fn)
             out_reports.append(shelrep)
+            out_reports.extend(
+                self._ammo_reports_after_mission(units, clock_main_line_fn)
+            )
 
         return {
             "active": self.mission.is_active(),
@@ -306,6 +323,7 @@ class IFMissionManager:
         for spec in specs:
             if spec["name"] == name and int(spec.get("count") or 0) > 0:
                 spec["count"] = int(spec["count"]) - 1
+                lose_equipment_ammunition(target, name, 1, self.catalog)
                 self.mission.mission_losses[name] = self.mission.mission_losses.get(name, 0) + 1
                 return True
         return False
@@ -381,3 +399,43 @@ class IFMissionManager:
             return "No losses reported."
         parts = [f"{n} {name}" for name, n in sorted(self.mission.mission_losses.items())]
         return "; ".join(parts)
+
+    def _ammo_reports_after_mission(
+        self,
+        units: list[dict[str, Any]],
+        clock_main_line_fn,
+    ) -> list[dict[str, Any]]:
+        assert self.mission is not None
+        reports: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        time_str = clock_main_line_fn(
+            self.mission.ended_sim_ms
+            if self.mission.ended_sim_ms is not None
+            else self.mission.started_sim_ms
+        )
+        for firer in self.mission.firers:
+            if firer.total_rounds_fired <= 0 or firer.unit_key in seen:
+                continue
+            seen.add(firer.unit_key)
+            u = next((x for x in units if x["key"] == firer.unit_key), None)
+            if not u:
+                continue
+            auth = float(u.get("ammoAuthorized") or 0)
+            on_hand = float(u.get("ammoOnHand") or 0)
+            pct = ammo_percent(auth, on_hand)
+            if auth <= 1e-9:
+                continue
+            addressee = u.get("battalion") or "ALL STATIONS"
+            caller = u.get("company") or u["key"]
+            reports.append(
+                self.reports.ammunition_status(
+                    addressee,
+                    caller,
+                    time_str,
+                    authorized=auth,
+                    on_hand=on_hand,
+                    percent=pct,
+                    unit_key=u["key"],
+                )
+            )
+        return reports

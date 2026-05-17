@@ -18,7 +18,13 @@ from backend.formation import (
 )
 from backend.artillery_fire import tick_exhaustion_recovery, time_in_position_ms
 from backend.clock import ExerciseClock
-from backend.combat import UnitStatsCatalog, compute_combat_totals, parse_equipment_field
+from backend.combat import (
+    UnitStatsCatalog,
+    ammo_percent,
+    compute_combat_totals,
+    init_unit_ammunition,
+    parse_equipment_field,
+)
 from backend.config import (
     DEFAULT_MINUTES_PER_STEP,
     MINUTES_PER_STEP_MAX,
@@ -28,6 +34,8 @@ from backend.config import (
     ROOT,
 )
 from backend.hex_grid import HexGrid
+from backend.df_mission import DFMissionManager, DFOpportunityEvent, DFModifiers
+from backend.direct_fire import DirectFireService, in_direct_fire_range, unit_has_direct_fire
 from backend.if_mission import IFMissionManager
 from backend.indirect_fire import IndirectFireService
 from backend.movement_cost import MovementCostRaster
@@ -52,11 +60,15 @@ class GameState:
         self.indirect_fire = IndirectFireService(self.grid, self.catalog)
         self.reports = ReportService()
         self.if_mission = IFMissionManager(self.catalog, self.reports)
+        self.direct_fire = DirectFireService(self.grid, self.catalog)
+        self.df_mission = DFMissionManager(self.catalog, self.reports)
         self.clock = ExerciseClock()
         self.minutes_per_step = DEFAULT_MINUTES_PER_STEP
         self.units: list[dict[str, Any]] = []
         self._acquisition_queue: list[AcquisitionEvent] = []
         self._acquisition_queue_dedup: set[tuple[str, str, str, str]] = set()
+        self._df_opportunity_queue: list[DFOpportunityEvent] = []
+        self._df_opportunity_dedup: set[tuple[str, str, str]] = set()
         self._report_queue: list[dict[str, Any]] = []
 
     def initialize(self) -> None:
@@ -77,7 +89,7 @@ class GameState:
         specs = parse_equipment_field(raw.get("equipment") or "")
         totals = compute_combat_totals(specs, self.catalog)
         pos_hex = self.grid.lat_lon_to_hex_key(raw["lat"], raw["lon"])
-        return {
+        unit: dict[str, Any] = {
             "key": unit_key(side, raw["company"], raw["battalion"]),
             "company": raw["company"],
             "battalion": raw["battalion"],
@@ -103,6 +115,8 @@ class GameState:
             "ifExhausted": False,
             "ifCeaseFireSimMs": None,
         }
+        init_unit_ammunition(unit, self.catalog)
+        return unit
 
     def _set_unit_halted(self, u: dict[str, Any], hex_key: str | None = None) -> None:
         u["activity"] = "halted"
@@ -113,6 +127,116 @@ class GameState:
 
     def _on_unit_hex_changed(self, u: dict[str, Any], new_hex_key: str) -> None:
         u["positionHexKey"] = new_hex_key
+
+    def halt_unit_for_df(self, u: dict[str, Any]) -> None:
+        """Stop movement for return fire without clearing battalion formation."""
+        u["activity"] = "halted"
+        u["destinationKey"] = None
+        u["routeWaypointKeys"] = []
+        u["routePath"] = None
+        u["routeLegIndex"] = 0
+        u["accumMovePoints"] = 0.0
+        self._set_unit_halted(u, u.get("positionHexKey"))
+
+    def check_df_opportunities(
+        self,
+        mover: dict[str, Any],
+        from_hex_key: str,
+        entered_hex_key: str,
+    ) -> list[DFOpportunityEvent]:
+        events: list[DFOpportunityEvent] = []
+        for other in self.units:
+            if other["side"] == mover["side"]:
+                continue
+            pairs = (
+                (other, mover),
+                (mover, other),
+            )
+            for shooter, victim in pairs:
+                if not unit_has_direct_fire(shooter):
+                    continue
+                if not in_direct_fire_range(self.grid, shooter, victim, self.catalog):
+                    continue
+                sk = shooter["key"]
+                vk = victim["key"]
+                sil = self.df_mission.silence_key(sk, vk, entered_hex_key)
+                if self.df_mission.is_silenced(sk, vk, entered_hex_key):
+                    continue
+                dedup = (sk, vk, entered_hex_key)
+                if dedup in self._df_opportunity_dedup:
+                    continue
+                self._df_opportunity_dedup.add(dedup)
+                events.append(
+                    DFOpportunityEvent(sk, vk, entered_hex_key, from_hex_key)
+                )
+        return events
+
+    def resolve_df_opportunity(
+        self,
+        shooter_key: str,
+        victim_key: str,
+        entered_hex_key: str,
+        confirm: bool,
+    ) -> dict[str, Any]:
+        if not confirm:
+            self.df_mission.mark_silenced(shooter_key, victim_key, entered_hex_key)
+            return {"confirmed": False}
+        return {
+            "confirmed": True,
+            "shooterKey": shooter_key,
+            "victimKey": victim_key,
+        }
+
+    def start_df_mission(
+        self,
+        shooter_keys: list[str],
+        victim_key: str,
+        victim_response: str,
+        target_dug_in: bool,
+        target_halted_obstacles: bool,
+        target_flank_shot: bool,
+        return_dug_in: bool,
+        return_halted_obstacles: bool,
+        return_flank_shot: bool,
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        victim_mods = DFModifiers(
+            dug_in=target_dug_in,
+            halted_obstacles=target_halted_obstacles,
+            flank_shot=target_flank_shot,
+        )
+        return_mods = DFModifiers(
+            dug_in=return_dug_in,
+            halted_obstacles=return_halted_obstacles,
+            flank_shot=return_flank_shot,
+        )
+        resp: str = (
+            "return_fire" if victim_response == "return_fire" else "continue_moving"
+        )
+
+        def in_range(shooter: dict[str, Any], victim: dict[str, Any]) -> bool:
+            return in_direct_fire_range(self.grid, shooter, victim, self.catalog)
+
+        return self.df_mission.start_mission(
+            self.units,
+            shooter_keys,
+            victim_key,
+            resp,  # type: ignore[arg-type]
+            victim_mods,
+            return_mods,
+            self.clock.sim_ms,
+            self.halt_unit_for_df,
+            in_range,
+        )
+
+    def cancel_df_mission(self) -> tuple[str | None, dict[str, Any]]:
+        err, result = self.df_mission.cancel_mission(
+            self.units,
+            self.clock.sim_ms,
+            ExerciseClock.format_main_line_at,
+        )
+        for rep in result.get("reports") or []:
+            self._report_queue.append(rep)
+        return err, result
 
     def get_unit(self, key: str) -> dict[str, Any] | None:
         for u in self.units:
@@ -418,8 +542,11 @@ class GameState:
             return "Waypoint move breaks the route"
         return None
 
-    def advance_movement_mp(self, mp_gain: float) -> list[AcquisitionEvent]:
+    def advance_movement_mp(
+        self, mp_gain: float
+    ) -> tuple[list[AcquisitionEvent], list[DFOpportunityEvent]]:
         new_events: list[AcquisitionEvent] = []
+        df_events: list[DFOpportunityEvent] = []
         formation_members: dict[str, list[dict[str, Any]]] = {}
         for u in self.units:
             bf = u.get("bnFormation")
@@ -499,6 +626,9 @@ class GameState:
                         self.units, u, cur_key, nx_key, self._acquisition_queue_dedup
                     )
                     new_events.extend(evs)
+                    df_events.extend(
+                        self.check_df_opportunities(u, cur_key, nx_key)
+                    )
                     if u["routeLegIndex"] >= len(path) - 1:
                         if bf and not bf.get("isLead"):
                             self._set_unit_halted(
@@ -509,39 +639,63 @@ class GameState:
                         break
                 else:
                     break
-        return new_events
+        return new_events, df_events
 
     def sim_tick(self, minutes_per_step: int | None = None) -> dict[str, Any]:
         steps = minutes_per_step if minutes_per_step is not None else self.minutes_per_step
         steps = max(MINUTES_PER_STEP_MIN, min(MINUTES_PER_STEP_MAX, int(steps)))
         self.minutes_per_step = steps
         all_events: list[AcquisitionEvent] = []
+        all_df_events: list[DFOpportunityEvent] = []
         if_reports: list[dict[str, Any]] = []
         for _ in range(steps):
             tick_exhaustion_recovery(self.units, self.clock.sim_ms)
             self.clock.advance_minutes(1)
             tick_exhaustion_recovery(self.units, self.clock.sim_ms)
-            minute_events = self.advance_movement_mp(MP_PER_MINUTE)
+            minute_events, minute_df = self.advance_movement_mp(MP_PER_MINUTE)
             all_events.extend(minute_events)
+            all_df_events.extend(minute_df)
             if_tick = self._tick_if_mission_minute()
             if_reports.extend(if_tick.get("reports") or [])
+            df_tick = self._tick_df_mission_minute()
+            if_reports.extend(df_tick.get("reports") or [])
         for ev in all_events:
             self._acquisition_queue.append(ev)
+        for ev in all_df_events:
+            self._df_opportunity_queue.append(ev)
         for rep in if_reports:
             self._report_queue.append(rep)
         tb = self.clock.timebar_strings()
         mission = self.if_mission.get_mission()
+        df_mission = self.df_mission.get_mission()
         return {
             "units": self.units,
             "simInstantMs": self.clock.sim_ms,
             "timebar": {"main": tb.main, "daynight": tb.daynight, "sunLine": tb.sun_line},
             "isDay": tb.is_day,
             "newAcquisitionEvents": [asdict(e) for e in all_events],
+            "newDfOpportunityEvents": [asdict(e) for e in all_df_events],
             "newReports": if_reports,
             "activeIfMission": mission.to_api_dict() if mission else None,
+            "activeDfMission": df_mission.to_api_dict() if df_mission else None,
             "minutesPerStep": self.minutes_per_step,
             "mpPerMinute": MP_PER_MINUTE,
         }
+
+    def _tick_df_mission_minute(self) -> dict[str, Any]:
+        def in_range(shooter: dict[str, Any], victim: dict[str, Any]) -> bool:
+            return in_direct_fire_range(self.grid, shooter, victim, self.catalog)
+
+        tick = self.df_mission.tick_minute(
+            self.units,
+            self.clock.sim_ms,
+            ExerciseClock.format_main_line_at,
+            in_range,
+        )
+        if not tick.get("active") and tick.get("reports"):
+            for rep in tick["reports"]:
+                self._report_queue.append(rep)
+        return tick
 
     def _tick_if_mission_minute(self) -> dict[str, Any]:
         return self.if_mission.tick_minute(
@@ -587,6 +741,7 @@ class GameState:
         for spec in u.get("equipmentSpecs") or []:
             st = self.catalog.get(spec["name"])
             art = self.catalog.get_artillery(spec["name"])
+            log = self.catalog.get_logistics(spec["name"])
             row: dict[str, Any] = {"name": spec["name"], "count": spec["count"]}
             if st:
                 row["stats"] = {
@@ -603,13 +758,38 @@ class GameState:
                     "displacementTimeMin": art.displacement_time_min,
                     "maxRateOfFirePerTube": art.max_rate_of_fire,
                     "sustainedRateOfFirePerTube": art.sustained_rate_of_fire,
+                    "ammoTons": art.ammo_tons,
+                    "tonsPerRound": art.tons_per_round,
+                }
+            man = self.catalog.get_maneuver(spec["name"])
+            if man:
+                row["ammunition"] = {
+                    "ammoTons": man.ammo_tons,
+                    "tonsPerMinDirectFire": man.ammo_tons_per_min_direct_fire,
+                    "tonsPerMinReturningFire": man.ammo_tons_per_min_returning_fire,
+                    "tonsPerMinCcAttack": man.ammo_tons_per_min_cc_attack,
+                    "tonsPerMinCcDefend": man.ammo_tons_per_min_cc_defend,
+                }
+            if log:
+                row["logistics"] = {
+                    "dryCargoTons": log.dry_cargo_tons,
+                    "fuelLiters": log.fuel_liters,
+                    "movement": log.movement,
                 }
             equipment.append(row)
+        auth = float(u.get("ammoAuthorized") or 0)
+        on_hand = float(u.get("ammoOnHand") or 0)
+        pct = ammo_percent(auth, on_hand)
         duration_ms = time_in_position_ms(u, self.clock.sim_ms)
         since = u.get("positionSinceSimMs") if u.get("activity") == "halted" else None
         return {
             "unit": u,
             "equipment": equipment,
+            "ammunition": {
+                "authorized": auth,
+                "onHand": on_hand,
+                "percent": pct,
+            },
             "positionHexKey": u.get("positionHexKey"),
             "positionSinceSimMs": since,
             "timeInPositionMs": duration_ms,
@@ -735,6 +915,7 @@ class GameState:
             "unitStats": self.catalog.to_api_dict(),
             "maneuverStats": self.catalog.maneuver_to_api_dict(),
             "artilleryStats": self.catalog.artillery_to_api_dict(),
+            "logisticStats": self.catalog.logistic_to_api_dict(),
             "units": self.units,
             "simInstantMs": self.clock.sim_ms,
             "timebar": {"main": tb.main, "daynight": tb.daynight, "sunLine": tb.sun_line},
@@ -743,6 +924,11 @@ class GameState:
             "activeIfMission": (
                 self.if_mission.get_mission().to_api_dict()
                 if self.if_mission.get_mission()
+                else None
+            ),
+            "activeDfMission": (
+                self.df_mission.get_mission().to_api_dict()
+                if self.df_mission.get_mission()
                 else None
             ),
         }

@@ -9,6 +9,8 @@ class ReportType(str, Enum):
     RECEIVING_IF = "receiving_indirect_fire"
     SHELREP = "shelrep"
     SPOT = "spot"
+    AMMO_STATUS = "ammunition_status"
+    DIRECT_FIRE_AAR = "direct_fire_after_action"
     GENERIC = "generic"
 
 
@@ -83,5 +85,87 @@ class ReportService:
                 "roundsLine": rounds_line,
                 "damageLine": damage_line,
                 "targetKey": target_key,
+            },
+        )
+
+    def ammunition_status(
+        self,
+        addressee: str,
+        caller: str,
+        time_str: str,
+        *,
+        authorized: float,
+        on_hand: float,
+        percent: float | None,
+        unit_key: str | None = None,
+    ) -> dict[str, Any]:
+        from backend.combat import format_ammo_percent, format_ammo_tons
+
+        pct_str = format_ammo_percent(percent)
+        text = (
+            f"{addressee} this is {caller}, ammunition report time {time_str}, break. "
+            f"Ammunition {format_ammo_tons(authorized)} tons authorized, "
+            f"{format_ammo_tons(on_hand)} tons on hand, {pct_str} remaining."
+        )
+        return self.create_report(
+            ReportType.AMMO_STATUS,
+            title="Ammunition status",
+            text=text,
+            meta={
+                "addressee": addressee,
+                "caller": caller,
+                "time": time_str,
+                "ammoAuthorized": authorized,
+                "ammoOnHand": on_hand,
+                "ammoPercent": percent,
+                "unitKey": unit_key,
+            },
+        )
+
+    def direct_fire_after_action(
+        self,
+        addressee: str,
+        caller: str,
+        time_str: str,
+        *,
+        role: str,
+        dfs: str,
+        ammo_authorized: float,
+        ammo_on_hand: float,
+        ammo_percent: float | None,
+        ammo_consumed: float,
+        kills_inflicted: int,
+        losses: str,
+        unit_key: str | None = None,
+        opponent_key: str | None = None,
+    ) -> dict[str, Any]:
+        from backend.combat import format_ammo_percent, format_ammo_tons
+
+        text = (
+            f"{addressee} this is {caller}, direct fire after-action {role} time {time_str}, break. "
+            f"Direct fire score {dfs}. "
+            f"Ammunition {format_ammo_tons(ammo_authorized)} tons authorized, "
+            f"{format_ammo_tons(ammo_on_hand)} tons on hand ({format_ammo_percent(ammo_percent)}), "
+            f"{format_ammo_tons(ammo_consumed)} tons expended this engagement. "
+            f"Kills inflicted: {kills_inflicted}. Losses: {losses}."
+        )
+        return self.create_report(
+            ReportType.DIRECT_FIRE_AAR,
+            title=f"Direct fire report — {caller}",
+            text=text,
+            meta={
+                "addressee": addressee,
+                "caller": caller,
+                "time": time_str,
+                "role": role,
+                "dfs": dfs,
+                "ammoAuthorized": ammo_authorized,
+                "ammoOnHand": ammo_on_hand,
+                "ammoPercent": ammo_percent,
+                "ammoConsumed": ammo_consumed,
+                "killsInflicted": kills_inflicted,
+                "losses": losses,
+                "unitKey": unit_key,
+                "opponentKey": opponent_key,
             },
         )

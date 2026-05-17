@@ -40,34 +40,36 @@
       });
     },
     unitInfo: function (unitKey) {
-      return jsonFetch('/api/units/' + enc(unitKey) + '/info');
+      return jsonFetch('/api/units/info?unit_key=' + enc(unitKey));
     },
     moveOrder: function (unitKey, goalKey, extend) {
-      return jsonFetch('/api/units/' + enc(unitKey) + '/move-order', {
+      return jsonFetch('/api/units/move-order?unit_key=' + enc(unitKey), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ goal_key: goalKey, extend: !!extend }),
       });
     },
     clearRoute: function (unitKey) {
-      return jsonFetch('/api/units/' + enc(unitKey) + '/clear-route', { method: 'POST' });
+      return jsonFetch('/api/units/clear-route?unit_key=' + enc(unitKey), {
+        method: 'POST',
+      });
     },
     magicMove: function (unitKey, lat, lon) {
-      return jsonFetch('/api/units/' + enc(unitKey) + '/magic-move', {
+      return jsonFetch('/api/units/magic-move?unit_key=' + enc(unitKey), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ lat: lat, lon: lon }),
       });
     },
     removeWaypoint: function (unitKey, index) {
-      return jsonFetch('/api/units/' + enc(unitKey) + '/remove-waypoint', {
+      return jsonFetch('/api/units/remove-waypoint?unit_key=' + enc(unitKey), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ index: index }),
       });
     },
     waypoint: function (unitKey, kind, viaIndex, lat, lon) {
-      return jsonFetch('/api/units/' + enc(unitKey) + '/waypoint', {
+      return jsonFetch('/api/units/waypoint?unit_key=' + enc(unitKey), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -118,6 +120,42 @@
           confirm: payload.confirm,
         }),
       });
+    },
+    directFireCandidates: function (victimKey) {
+      return jsonFetch('/api/direct-fire/candidates?victim_key=' + enc(victimKey));
+    },
+    directFireOpportunityResolve: function (body) {
+      return jsonFetch('/api/direct-fire/opportunity/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          shooter_key: body.shooterKey,
+          victim_key: body.victimKey,
+          entered_hex_key: body.enteredHexKey,
+          from_hex_key: body.fromHexKey || '',
+          confirm: !!body.confirm,
+        }),
+      });
+    },
+    directFireResolve: function (body) {
+      return jsonFetch('/api/direct-fire/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          shooter_keys: body.shooter_keys || [],
+          victim_key: body.victim_key,
+          victim_response: body.victim_response,
+          target_dug_in: body.target_dug_in,
+          target_halted_obstacles: body.target_halted_obstacles,
+          target_flank_shot: body.target_flank_shot,
+          return_dug_in: body.return_dug_in,
+          return_halted_obstacles: body.return_halted_obstacles,
+          return_flank_shot: body.return_flank_shot,
+        }),
+      });
+    },
+    directFireCancel: function () {
+      return jsonFetch('/api/direct-fire/cancel', { method: 'POST' });
     },
     indirectFireCandidates: function (targetKey) {
       return jsonFetch('/api/indirect-fire/candidates?target_key=' + enc(targetKey));
