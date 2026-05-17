@@ -146,6 +146,29 @@
     reportsPop: function () {
       return jsonFetch('/api/reports/pop', { method: 'POST' });
     },
+    parseCoordinate: function (text) {
+      return jsonFetch('/api/geo/parse-coordinate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: text }),
+      });
+    },
+    battalionMoveOrder: function (body) {
+      return jsonFetch('/api/battalion/move-order', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          battalion_key: body.battalionKey,
+          route_hex_keys: body.routeHexKeys || [],
+          route_texts: body.routeTexts || [],
+          movement_type: body.movementType || 'administrative',
+          destination_action: body.destinationAction || 'assembly',
+          defense_line_hex_keys: body.defenseLineHexKeys || [],
+          defense_line_texts: body.defenseLineTexts || [],
+          threat_bearing_deg: body.threatBearingDeg,
+        }),
+      });
+    },
   };
 
   global.GameApi = GameApi;

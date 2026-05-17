@@ -1222,3 +1222,90 @@ html, body {
 .if-btn-fire:hover {
   background: #c2410c;
 }
+
+#battalion-move-modal.game-modal--map-passthrough {
+  pointer-events: none;
+}
+
+#battalion-move-modal.game-modal--map-passthrough .game-modal-backdrop {
+  pointer-events: none;
+}
+
+#battalion-move-modal.game-modal--map-passthrough .game-modal-panel {
+  pointer-events: auto;
+}
+
+#battalion-move-modal.game-modal--wide-panel .game-modal-panel {
+  max-width: 520px;
+  max-height: 85vh;
+  overflow: auto;
+  position: fixed;
+  left: 16px;
+  top: 88px;
+  margin: 0;
+}
+
+.bn-move-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.bn-move-section-title {
+  margin: 0 0 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #0f172a;
+}
+
+.bn-move-hint {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: #475569;
+  line-height: 1.35;
+}
+
+.bn-move-route-mode,
+.bn-move-radio {
+  display: block;
+  font-size: 12px;
+  margin: 4px 0;
+  color: #334155;
+}
+
+.bn-move-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #334155;
+}
+
+.bn-move-field textarea,
+.bn-move-field input[type='text'],
+.bn-move-select {
+  font-size: 12px;
+  padding: 6px 8px;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+}
+
+.bn-move-route-list {
+  margin: 0;
+  padding: 0 0 0 18px;
+  font-size: 11px;
+  color: #1e293b;
+  max-height: 72px;
+  overflow-y: auto;
+}
+
+.bn-move-defend-block {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.map.bn-move-map-active {
+  cursor: crosshair;
+}

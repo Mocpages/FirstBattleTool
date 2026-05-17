@@ -2,9 +2,20 @@
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Optional
 
 from backend.acquisition import AcquisitionEvent, AcquisitionService
+from backend.battalion_ai import BattalionMovePlanner
+from backend.coordinates import parse_coordinate
+from backend.battalion_ai import build_march_column, march_order_units
+from backend.formation import (
+    clear_formation,
+    column_target_hex,
+    effective_mp_for_formation,
+    formation_lead,
+    sync_formation_column,
+    unit_station_status,
+)
 from backend.artillery_fire import tick_exhaustion_recovery, time_in_position_ms
 from backend.clock import ExerciseClock
 from backend.combat import UnitStatsCatalog, compute_combat_totals, parse_equipment_field
@@ -144,6 +155,7 @@ class GameState:
         u["routePath"] = None
         u["routeLegIndex"] = 0
         u["accumMovePoints"] = 0.0
+        clear_formation(u)
         self._set_unit_halted(u)
 
     def assign_move_order(self, u: dict[str, Any], goal_key: str) -> str | None:
@@ -159,6 +171,38 @@ class GameState:
             return "No route."
         u["activity"] = "moving"
         return None
+
+    def assign_lead_move_order(
+        self,
+        u: dict[str, Any],
+        waypoint_keys: list[str],
+        destination_key: str,
+    ) -> str | None:
+        if not self.raster.hex_has_raster(destination_key):
+            return "Destination outside mv_cost.tif or nodata."
+        start = self.grid.lat_lon_to_hex_key(u["lat"], u["lon"])
+        if not self.raster.hex_has_raster(start):
+            return "Unit not on a hex covered by mv_cost.tif."
+        u["routeWaypointKeys"] = list(waypoint_keys)
+        u["destinationKey"] = destination_key
+        if not self.rebuild_route(u, True):
+            self.clear_route(u)
+            return "No route."
+        u["activity"] = "moving"
+        return None
+
+    def _assign_column_move(self, u: dict[str, Any], column_hex: str) -> None:
+        """Pathfind only to a column position — never through to the battalion destination."""
+        path = u.get("routePath") or []
+        leg = int(u.get("routeLegIndex") or 0)
+        if (
+            u.get("destinationKey") == column_hex
+            and u.get("activity") == "moving"
+            and path
+            and leg < len(path) - 1
+        ):
+            return
+        self.assign_move_order(u, column_hex)
 
     def extend_route(self, u: dict[str, Any], goal_key: str) -> str | None:
         if not u.get("destinationKey"):
@@ -177,6 +221,157 @@ class GameState:
             return "No route through vias to new destination."
         u["activity"] = "moving"
         return None
+
+    def battalion_units(self, battalion_key: str) -> list[dict[str, Any]]:
+        parts = battalion_key.split("|", 1)
+        if len(parts) != 2:
+            return []
+        side, battalion = parts[0], parts[1]
+        return [
+            u
+            for u in self.units
+            if u["side"] == side and u["battalion"] == battalion
+        ]
+
+    def execute_battalion_move_order(
+        self,
+        battalion_key: str,
+        route_keys: list[str],
+        route_texts: list[str],
+        movement_type: str,
+        destination_action: str,
+        defense_line_keys: list[str],
+        defense_line_texts: list[str],
+        threat_bearing_deg: Optional[float],
+    ) -> dict[str, Any]:
+        bn_units = self.battalion_units(battalion_key)
+        if not bn_units:
+            return {"ok": False, "message": "Battalion not found.", "units": []}
+
+        planner = BattalionMovePlanner(
+            self.grid,
+            self.pathfinder,
+            self.catalog,
+            self.raster.hex_has_raster,
+        )
+        def_line = list(defense_line_keys)
+        for txt in defense_line_texts:
+            parsed = parse_coordinate(txt)
+            if not parsed:
+                return {
+                    "ok": False,
+                    "message": f"Could not parse defensive point: {txt}",
+                    "units": [],
+                }
+            def_line.append(self.grid.lat_lon_to_hex_key(parsed[0], parsed[1]))
+
+        vias, dest, route_err = planner.resolve_route(route_keys, route_texts)
+        if route_err and not (destination_action == "defend" and len(def_line) >= 2):
+            return {"ok": False, "message": route_err, "units": []}
+        if vias is None or dest is None:
+            if destination_action == "defend" and len(def_line) >= 2:
+                vias = []
+                dest = def_line[len(def_line) // 2]
+            else:
+                return {
+                    "ok": False,
+                    "message": route_err or "Invalid route.",
+                    "units": [],
+                }
+
+        column = build_march_column(bn_units, movement_type)
+        ordered = march_order_units(column)
+        if not ordered:
+            return {"ok": False, "message": "No units in battalion.", "units": []}
+
+        lead = ordered[0]
+        ref_path = planner.reference_path_for_lead(lead, vias, dest) or []
+
+        goals, err = planner.plan_goal_hexes(
+            bn_units,
+            ref_path,
+            dest,
+            movement_type,
+            destination_action,
+            def_line if destination_action == "defend" else None,
+            threat_bearing_deg,
+        )
+        if err:
+            return {"ok": False, "message": err, "units": []}
+
+        failures: list[str] = []
+        updated: list[dict[str, Any]] = []
+        use_column = movement_type != "emergency" and ref_path and destination_action not in (
+            "defend",
+        )
+
+        for march_i, u in enumerate(ordered):
+            goal = goals.get(u["key"])
+            if not goal:
+                failures.append(f"{u['company']}: no assigned position")
+                continue
+
+            is_lead = march_i == 0 and use_column
+            # March-order slots on ref_path (front→rear). Do not use goal hex index —
+            # tactical disposition goals can sit ahead of the lead and invert the column.
+            path_slot = (
+                planner.column_slot_index(ref_path, march_i)
+                if use_column
+                else 0
+            )
+
+            if use_column:
+                u["bnFormation"] = {
+                    "battalionKey": battalion_key,
+                    "movementType": movement_type,
+                    "refPath": ref_path,
+                    "pathSlot": path_slot,
+                    "isLead": is_lead,
+                    "maxLeadHex": 1,
+                    "maxLagHex": 1,
+                }
+            else:
+                clear_formation(u)
+
+            if movement_type == "emergency":
+                move_err = self.assign_move_order(u, goal)
+            elif use_column:
+                if is_lead:
+                    move_err = self.assign_lead_move_order(u, vias, dest)
+                else:
+                    lead_slot = int(
+                        (ordered[0].get("bnFormation") or {}).get(
+                            "pathSlot", len(ref_path) - 1
+                        )
+                    )
+                    if destination_action == "defend":
+                        col_hex = goal
+                    else:
+                        col_hex = column_target_hex(
+                            ref_path, 0, lead_slot, path_slot
+                        )
+                    self._assign_column_move(u, col_hex)
+                    move_err = None
+                    if u.get("activity") != "moving" and not u.get("routePath"):
+                        move_err = "No route to column position"
+            else:
+                move_err = self.assign_move_order(u, goal)
+            if move_err:
+                failures.append(f"{u['company']}: {move_err}")
+                clear_formation(u)
+            updated.append(u)
+
+        msg = f"Battalion move issued to {len(updated)} companies."
+        if failures:
+            msg += " Issues: " + "; ".join(failures[:4])
+            if len(failures) > 4:
+                msg += f" (+{len(failures) - 4} more)"
+        return {
+            "ok": len(failures) < len(bn_units),
+            "message": msg,
+            "units": self.units,
+            "assigned": {k: v for k, v in goals.items()},
+        }
 
     def magic_move(self, u: dict[str, Any], lat: float, lon: float) -> None:
         u["destinationKey"] = None
@@ -225,16 +420,67 @@ class GameState:
 
     def advance_movement_mp(self, mp_gain: float) -> list[AcquisitionEvent]:
         new_events: list[AcquisitionEvent] = []
+        formation_members: dict[str, list[dict[str, Any]]] = {}
         for u in self.units:
-            if u["activity"] != "moving" or not u.get("routePath"):
+            bf = u.get("bnFormation")
+            if bf:
+                bk = bf.get("battalionKey", "")
+                formation_members.setdefault(bk, []).append(u)
+
+        for bk, members in formation_members.items():
+            if len(members) < 2:
                 continue
-            path = u["routePath"]
-            if u["routeLegIndex"] >= len(path) - 1:
-                self.clear_route(u)
+            lead = formation_lead(members)
+            if lead:
+                sync_formation_column(
+                    self.grid,
+                    lead,
+                    members,
+                    self._assign_column_move,
+                )
+
+        for u in self.units:
+            path = u.get("routePath")
+            bf = u.get("bnFormation")
+            if path and u["routeLegIndex"] >= len(path) - 1:
+                if bf and not bf.get("isLead"):
+                    members = formation_members.get(
+                        (bf or {}).get("battalionKey", ""), []
+                    )
+                    lead_u = formation_lead(members)
+                    ref_path = (bf or {}).get("refPath") or []
+                    st = (
+                        unit_station_status(
+                            self.grid, ref_path, u, lead_u, members
+                        )
+                        if lead_u and ref_path
+                        else "on_station"
+                    )
+                    if st == "behind":
+                        if u.get("activity") == "halted":
+                            u["activity"] = "moving"
+                    else:
+                        u["activity"] = "halted"
+                        continue
+                elif u["activity"] == "moving":
+                    self.clear_route(u)
+                    continue
+                else:
+                    continue
+            if u["activity"] != "moving" or not path:
                 continue
-            u["accumMovePoints"] = float(u.get("accumMovePoints") or 0) + mp_gain
+            bk = (bf or {}).get("battalionKey", "")
+            members = formation_members.get(bk, [])
+            gain = effective_mp_for_formation(self.grid, u, members, mp_gain)
+            if gain <= 0:
+                u["accumMovePoints"] = 0.0
+            else:
+                u["accumMovePoints"] = float(u.get("accumMovePoints") or 0) + gain
+            max_hex_steps = 48
+            if bf and bf.get("movementType") != "emergency":
+                max_hex_steps = 1
             guard = 0
-            while guard < 48 and u["routeLegIndex"] < len(path) - 1:
+            while guard < max_hex_steps and u["routeLegIndex"] < len(path) - 1:
                 guard += 1
                 cur_key = path[u["routeLegIndex"]]
                 nx_key = path[u["routeLegIndex"] + 1]
@@ -254,7 +500,12 @@ class GameState:
                     )
                     new_events.extend(evs)
                     if u["routeLegIndex"] >= len(path) - 1:
-                        self.clear_route(u)
+                        if bf and not bf.get("isLead"):
+                            self._set_unit_halted(
+                                u, path[u["routeLegIndex"]]
+                            )
+                        else:
+                            self.clear_route(u)
                         break
                 else:
                     break

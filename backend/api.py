@@ -98,6 +98,21 @@ class SimTickBody(BaseModel):
     minutes_per_step: Optional[int] = None
 
 
+class ParseCoordinateBody(BaseModel):
+    text: str
+
+
+class BattalionMoveBody(BaseModel):
+    battalion_key: str
+    route_hex_keys: list[str] = Field(default_factory=list)
+    route_texts: list[str] = Field(default_factory=list)
+    movement_type: str = "administrative"
+    destination_action: str = "assembly"
+    defense_line_hex_keys: list[str] = Field(default_factory=list)
+    defense_line_texts: list[str] = Field(default_factory=list)
+    threat_bearing_deg: Optional[float] = None
+
+
 @app.get("/api/bootstrap")
 def bootstrap() -> dict[str, Any]:
     return game.bootstrap()
@@ -214,6 +229,44 @@ def segment_costs(body: PathBody) -> dict[str, Any]:
 def geo_hex_key(lat: float, lon: float) -> dict[str, Any]:
     key = game.grid.lat_lon_to_hex_key(lat, lon)
     return {"key": key, "hasRaster": game.raster.hex_has_raster(key)}
+
+
+@app.post("/api/geo/parse-coordinate")
+def geo_parse_coordinate(body: ParseCoordinateBody) -> dict[str, Any]:
+    from backend.coordinates import parse_coordinate
+
+    parsed = parse_coordinate(body.text)
+    if not parsed:
+        return {"ok": False, "message": "Could not parse coordinate."}
+    lat, lon = parsed
+    key = game.grid.lat_lon_to_hex_key(lat, lon)
+    return {
+        "ok": True,
+        "lat": lat,
+        "lon": lon,
+        "key": key,
+        "hasRaster": game.raster.hex_has_raster(key),
+    }
+
+
+@app.post("/api/battalion/move-order")
+def battalion_move_order(body: BattalionMoveBody) -> dict[str, Any]:
+    mt = (body.movement_type or "administrative").strip().lower()
+    if mt not in ("administrative", "tactical", "emergency"):
+        raise HTTPException(400, "movement_type must be administrative, tactical, or emergency")
+    da = (body.destination_action or "assembly").strip().lower()
+    if da not in ("assembly", "defend", "attack"):
+        raise HTTPException(400, "destination_action must be assembly, defend, or attack")
+    return game.execute_battalion_move_order(
+        body.battalion_key,
+        body.route_hex_keys,
+        body.route_texts,
+        mt,
+        da,
+        body.defense_line_hex_keys,
+        body.defense_line_texts,
+        body.threat_bearing_deg,
+    )
 
 
 @app.get("/api/terrain/hexes")

@@ -31,14 +31,7 @@
       <li class="order-bar-item order-bar-item--has-submenu">
         <span class="order-bar-label" tabindex="0">Friendly orders</span>
         <ul class="order-dropdown order-dropdown--1" role="menu">
-          <li class="order-sub-item order-sub-item--has-submenu">
-            <span class="order-sub-label">Move</span>
-            <ul class="order-dropdown order-dropdown--2" role="menu">
-              <li><button type="button" class="order-leaf" data-action="friendly-move-traveling">Traveling</button></li>
-              <li><button type="button" class="order-leaf" data-action="friendly-move-traveling-overwatch">Traveling overwatch</button></li>
-              <li><button type="button" class="order-leaf" data-action="friendly-move-bounding-overwatch">Bounding overwatch</button></li>
-            </ul>
-          </li>
+          <li><button type="button" class="order-leaf" data-action="friendly-battalion-move">Move</button></li>
         </ul>
       </li>
       <li class="order-bar-item order-bar-item--has-submenu">
@@ -130,6 +123,59 @@
         <div class="if-modal-footer-actions">
           <button type="button" id="if-btn-fire" class="if-btn-fire">FIRE</button>
         </div>
+      </div>
+    </div>
+  </div>
+  <div id="battalion-move-modal" class="game-modal game-modal--map-passthrough game-modal--wide-panel" role="dialog" aria-modal="true" aria-labelledby="bn-move-modal-title" hidden>
+    <div class="game-modal-backdrop"></div>
+    <div class="game-modal-panel game-modal-panel--wide bn-move-panel">
+      <h2 id="bn-move-modal-title" class="game-modal-title game-modal-drag-handle">Battalion movement order</h2>
+      <div class="game-modal-body bn-move-body">
+        <section class="bn-move-section">
+          <h3 class="bn-move-section-title">1. Route</h3>
+          <div class="bn-move-route-mode">
+            <label class="bn-move-radio"><input type="radio" name="bn-route-mode" value="map" checked /> Define on map (right-click)</label>
+            <label class="bn-move-radio"><input type="radio" name="bn-route-mode" value="text" /> Enter waypoints as text</label>
+          </div>
+          <p id="bn-move-map-hint" class="bn-move-hint">Right-click to add waypoints in order; the last point is the destination. Alt+right-click (defend): defensive line point.</p>
+          <ul id="bn-move-route-list" class="bn-move-route-list"></ul>
+          <label class="bn-move-field" id="bn-move-waypoints-wrap" hidden>
+            <span>Waypoints (one per line — MGRS or lat, lon; last line is destination)</span>
+            <textarea id="bn-move-waypoints-text" rows="5" placeholder="32UMU123456&#10;50.55, 9.67&#10;50.52, 9.70"></textarea>
+          </label>
+        </section>
+        <section class="bn-move-section">
+          <h3 class="bn-move-section-title">2. Movement type</h3>
+          <select id="bn-move-type" class="bn-move-select">
+            <option value="administrative">Administrative</option>
+            <option value="tactical">Tactical</option>
+            <option value="emergency">Emergency</option>
+          </select>
+        </section>
+        <section class="bn-move-section">
+          <h3 class="bn-move-section-title">3. Action at destination</h3>
+          <select id="bn-move-action" class="bn-move-select">
+            <option value="assembly">Occupy assembly area</option>
+            <option value="defend">Defend</option>
+            <option value="attack">Attack</option>
+          </select>
+          <div id="bn-move-defend-block" class="bn-move-defend-block" hidden>
+            <p class="bn-move-hint">Defensive line: alt+right-click map to add points, or enter coordinates (one per line).</p>
+            <ul id="bn-move-defense-list" class="bn-move-route-list"></ul>
+            <label class="bn-move-field">
+              <span>Defensive line (text)</span>
+              <textarea id="bn-move-defense-text" rows="3"></textarea>
+            </label>
+            <label class="bn-move-field">
+              <span>Threat direction (degrees from north, toward enemy)</span>
+              <input type="number" id="bn-move-threat-bearing" min="0" max="359" step="1" value="90" />
+            </label>
+          </div>
+        </section>
+      </div>
+      <div class="game-modal-actions">
+        <button type="button" id="bn-move-cancel" class="game-modal-btn game-modal-btn--secondary">Cancel</button>
+        <button type="button" id="bn-move-issue" class="game-modal-btn game-modal-btn--primary">Issue order</button>
       </div>
     </div>
   </div>

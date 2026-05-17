@@ -15,6 +15,7 @@ VALID_UNIT_TYPES = frozenset(
         "missile",
         "command",
         "logistics",
+        "recon",
     }
 )
 VALID_UNIT_SIZES = frozenset(

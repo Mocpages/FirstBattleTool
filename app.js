@@ -13,8 +13,13 @@
   var EQUIP_SIDEBAR_W = 68;
   /** Hex mesh only at this zoom level and closer (zoomed further in). */
   var HEX_GRID_MIN_ZOOM = 11;
-  /** If closest pair of companies in the same battalion is under this distance in px, show battalion marker only. */
-  var COMPANY_OVERLAP_PIXELS = 48;
+  /**
+   * Battalion aggregate only when zoomed out past this level (higher zoom = more map detail).
+   * At zoom 13+ individual company markers are always shown.
+   */
+  var BATTALION_AGGREGATE_MAX_ZOOM = 12;
+  /** Max screen distance (px) from battalion centroid to farthest company to merge into one marker. */
+  var COMPANY_AGGREGATE_CLUSTER_PX = 28;
   /** Blue LOS outline is the outer perimeter of ZOC ∪ any hex centre within this of a ZOC hex (≈ ZoC boundary + 3000 m). */
   var LOS_BUFFER_PAST_ZOC_M = 3000;
 
@@ -139,6 +144,7 @@
     u.ifCeaseFireSimMs = su.ifCeaseFireSimMs;
     if (su.unitType != null) u.unitType = su.unitType;
     if (su.unitSize != null) u.unitSize = su.unitSize;
+    if (su.bnFormation !== undefined) u.bnFormation = su.bnFormation;
     return u;
   }
 
@@ -1454,9 +1460,9 @@
     resetAcquisitionModalPanelLayout();
   }
 
-  function initAcquisitionModalDrag() {
-    var root = document.getElementById('acquisition-modal');
-    var handle = document.getElementById('acquisition-modal-title');
+  function initModalDrag(rootId, handleId) {
+    var root = document.getElementById(rootId);
+    var handle = document.getElementById(handleId);
     if (!root || !handle || handle.getAttribute('data-drag-init') === '1') return;
     handle.setAttribute('data-drag-init', '1');
     var panel = root.querySelector('.game-modal-panel');
@@ -1516,6 +1522,10 @@
 
     handle.addEventListener('mousedown', onPointerDown);
     handle.addEventListener('touchstart', onPointerDown, { passive: false });
+  }
+
+  function initAcquisitionModalDrag() {
+    initModalDrag('acquisition-modal', 'acquisition-modal-title');
   }
 
   function hideSpotReportModal() {
@@ -2223,25 +2233,33 @@
     }
   }
 
-  function companiesOverlapPixels(us) {
+  function companiesShouldAggregate(us) {
     if (us.length < 2) return false;
+    if (map.getZoom() > BATTALION_AGGREGATE_MAX_ZOOM) {
+      return false;
+    }
     var pts = us.map(function (u) {
       return map.latLngToContainerPoint(L.latLng(u.lat, u.lon));
     });
+    var cx = 0;
+    var cy = 0;
     var i;
-    var j;
-    var limit = COMPANY_OVERLAP_PIXELS;
     for (i = 0; i < pts.length; i++) {
-      for (j = i + 1; j < pts.length; j++) {
-        if (pts[i].distanceTo(pts[j]) < limit) {
-          return true;
-        }
-      }
+      cx += pts[i].x;
+      cy += pts[i].y;
     }
-    return false;
+    cx /= pts.length;
+    cy /= pts.length;
+    var center = L.point(cx, cy);
+    var maxDist = 0;
+    for (i = 0; i < pts.length; i++) {
+      var d = pts[i].distanceTo(center);
+      if (d > maxDist) maxDist = d;
+    }
+    return maxDist < COMPANY_AGGREGATE_CLUSTER_PX;
   }
 
-  /** Decide per battalion: company markers vs aggregated battalion marker (screen-pixel overlap). */
+  /** Decide per battalion: company markers vs aggregated battalion marker (zoom + tight cluster). */
   function refreshMarkerDisplay() {
     if (Object.keys(markerByKey).length === 0) {
       return;
@@ -2261,7 +2279,7 @@
     for (bk in battalionGroupsMap) {
       if (!Object.prototype.hasOwnProperty.call(battalionGroupsMap, bk)) continue;
       var grp = battalionGroupsMap[bk];
-      var useAgg = grp.units.length >= 2 && companiesOverlapPixels(grp.units);
+      var useAgg = companiesShouldAggregate(grp.units);
       battalionOverlapAgg[bk] = useAgg;
       var bi;
       if (useAgg) {
@@ -2886,13 +2904,298 @@
   function updateOrderMenusVisibility() {
     var nav = document.getElementById('order-menus');
     if (!nav) return;
-    var show = selectionMode === 'company' && !!selectionCompanyKey;
+    var show =
+      (selectionMode === 'company' && !!selectionCompanyKey) ||
+      (selectionMode === 'battalion' && !!selectionBattalionKey);
     if (!show) {
       cancelMagicMove();
       nav.hidden = true;
     } else {
       nav.hidden = false;
     }
+  }
+
+  var bnMoveDraft = {
+    open: false,
+    routeMode: 'map',
+    routeKeys: [],
+    defenseLineKeys: [],
+  };
+  var bnMoveLayerGroup = L.layerGroup({ pane: 'routePane' }).addTo(map);
+
+  function isBattalionMoveModalOpen() {
+    var el = document.getElementById('battalion-move-modal');
+    return !!(el && !el.hidden);
+  }
+
+  function parseCoordClient(text) {
+    var raw = (text || '').trim();
+    if (!raw) return null;
+    if (typeof mgrs !== 'undefined' && mgrs.toPoint) {
+      try {
+        var pt = mgrs.toPoint(raw.replace(/\s+/g, ''));
+        if (pt && pt.length >= 2) return { lat: pt[1], lon: pt[0] };
+      } catch (e1) {
+        /* ignore */
+      }
+    }
+    var m = raw.match(/^\s*(-?\d+(?:\.\d+)?)\s*[,;\s]\s*(-?\d+(?:\.\d+)?)\s*$/);
+    if (m) {
+      var a = parseFloat(m[1]);
+      var b = parseFloat(m[2]);
+      if (Math.abs(a) <= 90 && Math.abs(b) <= 180) return { lat: a, lon: b };
+      if (Math.abs(b) <= 90 && Math.abs(a) <= 180) return { lat: b, lon: a };
+    }
+    return null;
+  }
+
+  function refreshBnMoveRouteList() {
+    var ul = document.getElementById('bn-move-route-list');
+    if (!ul) return;
+    var keys = bnMoveDraft.routeKeys;
+    if (!keys.length) {
+      ul.innerHTML = '<li class="bn-move-hint">No waypoints yet.</li>';
+      return;
+    }
+    var items = [];
+    var wi;
+    for (wi = 0; wi < keys.length; wi++) {
+      var label = wi === keys.length - 1 ? 'Destination' : 'WP ' + (wi + 1);
+      items.push(
+        '<li>' +
+          (wi === keys.length - 1 ? '<strong>' : '') +
+          label +
+          ': ' +
+          escapeHtmlLite(keys[wi]) +
+          (wi === keys.length - 1 ? '</strong>' : '') +
+          '</li>',
+      );
+    }
+    ul.innerHTML = items.join('');
+  }
+
+  function refreshBnMoveDefenseList() {
+    var ul = document.getElementById('bn-move-defense-list');
+    if (!ul) return;
+    var items = [];
+    var di;
+    for (di = 0; di < bnMoveDraft.defenseLineKeys.length; di++) {
+      items.push('<li>Point ' + (di + 1) + ': ' + escapeHtmlLite(bnMoveDraft.defenseLineKeys[di]) + '</li>');
+    }
+    ul.innerHTML = items.length ? items.join('') : '<li class="bn-move-hint">No defensive points yet.</li>';
+  }
+
+  function redrawBnMoveOverlay() {
+    bnMoveLayerGroup.clearLayers();
+    if (!isBattalionMoveModalOpen()) return;
+    var keys = bnMoveDraft.routeKeys;
+    if (keys.length < 1) return;
+    var latLngs = [];
+    var ki;
+    for (ki = 0; ki < keys.length; ki++) {
+      var qr = parseHexKey(keys[ki]);
+      var ll = axialCenterLatLon(qr[0], qr[1]);
+      latLngs.push([ll[0], ll[1]]);
+    }
+    if (latLngs.length >= 2) {
+      L.polyline(latLngs, {
+        color: '#1d4ed8',
+        weight: 4,
+        opacity: 0.85,
+        pane: 'routePane',
+        interactive: false,
+      }).addTo(bnMoveLayerGroup);
+    }
+    for (ki = 0; ki < latLngs.length; ki++) {
+      L.circleMarker(latLngs[ki], {
+        radius: ki === latLngs.length - 1 ? 7 : 5,
+        color: ki === latLngs.length - 1 ? '#b45309' : '#1d4ed8',
+        fillOpacity: 0.85,
+        pane: 'routePane',
+      }).addTo(bnMoveLayerGroup);
+    }
+    var defKeys = bnMoveDraft.defenseLineKeys;
+    if (defKeys.length >= 2) {
+      var dLatLngs = [];
+      for (ki = 0; ki < defKeys.length; ki++) {
+        var dqr = parseHexKey(defKeys[ki]);
+        var dll = axialCenterLatLon(dqr[0], dqr[1]);
+        dLatLngs.push([dll[0], dll[1]]);
+      }
+      L.polyline(dLatLngs, {
+        color: '#15803d',
+        weight: 3,
+        dashArray: '6,4',
+        pane: 'routePane',
+        interactive: false,
+      }).addTo(bnMoveLayerGroup);
+    }
+  }
+
+  function updateBnMoveFormVisibility() {
+    var mapHint = document.getElementById('bn-move-map-hint');
+    var wpWrap = document.getElementById('bn-move-waypoints-wrap');
+    var defendBlock = document.getElementById('bn-move-defend-block');
+    var actionEl = document.getElementById('bn-move-action');
+    var isMap = bnMoveDraft.routeMode === 'map';
+    if (mapHint) mapHint.hidden = !isMap;
+    if (wpWrap) wpWrap.hidden = isMap;
+    if (defendBlock && actionEl) {
+      defendBlock.hidden = actionEl.value !== 'defend';
+    }
+    refreshBnMoveRouteList();
+    refreshBnMoveDefenseList();
+    redrawBnMoveOverlay();
+  }
+
+  function openBattalionMoveModal() {
+    if (!(selectionMode === 'battalion' && selectionBattalionKey)) {
+      setStatus('Select a battalion (double-click aggregate marker) to issue a move order.');
+      return;
+    }
+    bnMoveDraft.open = true;
+    bnMoveDraft.routeMode = 'map';
+    bnMoveDraft.routeKeys = [];
+    bnMoveDraft.defenseLineKeys = [];
+    var modal = document.getElementById('battalion-move-modal');
+    if (modal) modal.hidden = false;
+    var mapEl = map.getContainer();
+    if (mapEl) mapEl.classList.add('bn-move-map-active');
+    updateBnMoveFormVisibility();
+    setStatus('Battalion move: right-click map for route; configure movement in the dialog.');
+  }
+
+  function closeBattalionMoveModal() {
+    bnMoveDraft.open = false;
+    var modal = document.getElementById('battalion-move-modal');
+    if (modal) modal.hidden = true;
+    var mapEl = map.getContainer();
+    if (mapEl) mapEl.classList.remove('bn-move-map-active');
+    bnMoveLayerGroup.clearLayers();
+  }
+
+  function handleBnMoveMapPick(latlng, shiftKey, altKey) {
+    if (!isBattalionMoveModalOpen()) return false;
+    var actionEl = document.getElementById('bn-move-action');
+    if (actionEl && actionEl.value === 'defend' && altKey) {
+      GameApi.hexKeyAt(latlng.lat, latlng.lng).then(function (geo) {
+        if (!geo.hasRaster) {
+          setStatus('Point outside movement map.');
+          return;
+        }
+        bnMoveDraft.defenseLineKeys.push(geo.key);
+        refreshBnMoveDefenseList();
+        redrawBnMoveOverlay();
+      });
+      return true;
+    }
+    if (bnMoveDraft.routeMode !== 'map') return false;
+    GameApi.hexKeyAt(latlng.lat, latlng.lng).then(function (geo) {
+      if (!geo.hasRaster) {
+        setStatus('Point outside movement map.');
+        return;
+      }
+      bnMoveDraft.routeKeys.push(geo.key);
+      setStatus(
+        'Waypoint ' +
+          bnMoveDraft.routeKeys.length +
+          ' added' +
+          (bnMoveDraft.routeKeys.length > 1 ? ' (previous point is now via)' : ' (destination)'),
+      );
+      refreshBnMoveRouteList();
+      redrawBnMoveOverlay();
+    });
+    return true;
+  }
+
+  function issueBattalionMoveOrder() {
+    if (!selectionBattalionKey) return;
+    var movementType = document.getElementById('bn-move-type').value;
+    var destinationAction = document.getElementById('bn-move-action').value;
+    var routeTexts = [];
+    if (bnMoveDraft.routeMode === 'text') {
+      var wpTa = document.getElementById('bn-move-waypoints-text');
+      if (wpTa && wpTa.value.trim()) {
+        routeTexts = wpTa.value
+          .split(/\r?\n/)
+          .map(function (ln) {
+            return ln.trim();
+          })
+          .filter(Boolean);
+      }
+    }
+    var defenseTexts = [];
+    var defTa = document.getElementById('bn-move-defense-text');
+    if (defTa && defTa.value.trim()) {
+      defenseTexts = defTa.value
+        .split(/\r?\n/)
+        .map(function (ln) {
+          return ln.trim();
+        })
+        .filter(Boolean);
+    }
+    var threatEl = document.getElementById('bn-move-threat-bearing');
+    var threat =
+      threatEl && threatEl.value !== '' ? parseFloat(threatEl.value) : null;
+    if (bnMoveDraft.routeMode === 'map' && bnMoveDraft.routeKeys.length < 1 && routeTexts.length < 1) {
+      setStatus('Add at least one waypoint on the map (last is destination).');
+      return;
+    }
+    if (bnMoveDraft.routeMode === 'text' && routeTexts.length < 1) {
+      setStatus('Enter at least one waypoint (last line is destination).');
+      return;
+    }
+    if (destinationAction === 'defend' && bnMoveDraft.defenseLineKeys.length < 2 && defenseTexts.length < 2) {
+      setStatus('Defend requires at least two defensive line points.');
+      return;
+    }
+    GameApi.battalionMoveOrder({
+      battalionKey: selectionBattalionKey,
+      routeHexKeys: bnMoveDraft.routeKeys,
+      routeTexts: routeTexts,
+      movementType: movementType,
+      destinationAction: destinationAction,
+      defenseLineHexKeys: bnMoveDraft.defenseLineKeys,
+      defenseLineTexts: defenseTexts,
+      threatBearingDeg: threat,
+    })
+      .then(function (res) {
+        if (res.units) applyServerUnits(res.units);
+        units.forEach(function (u) {
+          refreshUnitMarkerIcon(u);
+        });
+        refreshAllUnitMarkerRouteButtons();
+        updateMarkerClasses();
+        closeBattalionMoveModal();
+        setStatus(res.message || (res.ok ? 'Battalion move issued.' : 'Battalion move failed.'));
+      })
+      .catch(function (err) {
+        setStatus('Battalion move failed: ' + err.message);
+      });
+  }
+
+  function initBattalionMoveModal() {
+    var modal = document.getElementById('battalion-move-modal');
+    if (!modal) return;
+    var radios = modal.querySelectorAll('input[name="bn-route-mode"]');
+    var ri;
+    for (ri = 0; ri < radios.length; ri++) {
+      radios[ri].addEventListener('change', function (ev) {
+        bnMoveDraft.routeMode = ev.target.value;
+        updateBnMoveFormVisibility();
+      });
+    }
+    var actionEl = document.getElementById('bn-move-action');
+    if (actionEl) {
+      actionEl.addEventListener('change', updateBnMoveFormVisibility);
+    }
+    var cancelBtn = document.getElementById('bn-move-cancel');
+    if (cancelBtn) cancelBtn.addEventListener('click', closeBattalionMoveModal);
+    var issueBtn = document.getElementById('bn-move-issue');
+    if (issueBtn) issueBtn.addEventListener('click', issueBattalionMoveOrder);
+    var backdrop = modal.querySelector('.game-modal-backdrop');
+    if (backdrop) backdrop.addEventListener('click', closeBattalionMoveModal);
+    initModalDrag('battalion-move-modal', 'bn-move-modal-title');
   }
 
   function startMagicMove() {
@@ -3029,6 +3332,9 @@
     if (isClickOnRouteOrUnitRouteControl(e)) {
       return;
     }
+    if (isBattalionMoveModalOpen()) {
+      return;
+    }
     if (magicMovePending) {
       cancelMagicMove();
       if (selectionMode === 'company' && selectionCompanyKey) {
@@ -3040,6 +3346,14 @@
   });
 
   map.on('contextmenu', function (e) {
+    if (isBattalionMoveModalOpen()) {
+      L.DomEvent.preventDefault(e.originalEvent);
+      L.DomEvent.stopPropagation(e);
+      if (e.originalEvent) L.DomEvent.stopPropagation(e.originalEvent);
+      var oe = e.originalEvent;
+      handleBnMoveMapPick(e.latlng, oe && oe.shiftKey, oe && oe.altKey);
+      return;
+    }
     if (magicMovePending && selectionMode === 'company' && selectionCompanyKey) {
       L.DomEvent.preventDefault(e.originalEvent);
       L.DomEvent.stopPropagation(e);
@@ -3854,16 +4168,12 @@
         setStatus('Enemy order — assault (not implemented).');
         return;
       }
-      if (act === 'friendly-move-traveling') {
-        setStatus('Friendly order — move — traveling (not implemented).');
-        return;
-      }
-      if (act === 'friendly-move-traveling-overwatch') {
-        setStatus('Friendly order — move — traveling overwatch (not implemented).');
-        return;
-      }
-      if (act === 'friendly-move-bounding-overwatch') {
-        setStatus('Friendly order — move — bounding overwatch (not implemented).');
+      if (act === 'friendly-battalion-move') {
+        if (selectionMode !== 'battalion' || !selectionBattalionKey) {
+          setStatus('Select a battalion (double-click battalion marker) first.');
+          return;
+        }
+        openBattalionMoveModal();
         return;
       }
     });
@@ -3871,8 +4181,9 @@
 
   initIndirectFireModal();
   initUnitInfoModal();
+  initBattalionMoveModal();
   initOrderMenus();
   initAcquisitionModalDrag();
 
-  map.on('zoomend', refreshMarkerDisplay);
+  map.on('zoomend moveend', refreshMarkerDisplay);
 })();
